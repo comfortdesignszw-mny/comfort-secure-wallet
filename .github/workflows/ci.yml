@@ -1,0 +1,35 @@
+name: Comfort Secure Wallet CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript & Lint check
+        run: npm run lint
+
+      - name: Run unit, integration, and ledger property tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+      - name: Dependency vulnerability audit
+        run: npm audit --audit-level=high

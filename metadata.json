@@ -1,0 +1,6 @@
+{
+  "name": "Comfort Secure Wallet",
+  "description": "Licensed-grade mobile-first digital wallet for Zimbabwe and Africa with double-entry ledger, PIN step-up security, KYC onboarding, and maker-checker operations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

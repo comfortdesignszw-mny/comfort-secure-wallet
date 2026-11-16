@@ -1,0 +1,13 @@
+name = "comfort-secure-wallet"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = "dist"
+
+# Configure encrypted secrets directly in Cloudflare Pages Dashboard -> Settings -> Variables and Secrets:
+#   - WALLET_JWT_SECRET
+#   - WALLET_REFRESH_SECRET
+#   - WALLET_PIN_PEPPER
+#   - WALLET_FIELD_ENCRYPTION_KEY
+#   - WALLET_SIGNED_URL_SECRET
+#   - API_ORIGIN (e.g. https://api.comfortwallet.zw)
+#   - SUPER_ADMIN_EMAIL (defaults to comfort.designszw@gmail.com)

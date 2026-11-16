@@ -1,0 +1,123 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isSuperAdminEmail() {
+      return isVerified() && request.auth.token.email == 'comfort.designszw@gmail.com';
+    }
+
+    function isAdmin() {
+      return isSuperAdminEmail()
+        || (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidUserAccount(data, userId) {
+      return data.keys().hasAll(['id', 'role', 'staffStatus', 'status', 'kycStatus', 'kycTier', 'createdAt'])
+        && data.keys().hasOnly(['id', 'email', 'phone', 'role', 'staffStatus', 'requestedRole', 'status', 'kycStatus', 'kycTier', 'legalAcceptedAt', 'createdAt'])
+        && data.id is string && data.id == userId && data.id.size() <= 128
+        && data.role == 'USER'
+        && data.staffStatus in ['NONE', 'PENDING_APPROVAL']
+        && data.status in ['ACTIVE', 'FROZEN', 'CLOSED']
+        && data.kycStatus in ['NOT_SUBMITTED', 'PENDING', 'APPROVED', 'REJECTED', 'NEEDS_MORE_INFO']
+        && data.kycTier is int && data.kycTier >= 0 && data.kycTier <= 3
+        && data.createdAt == request.time;
+    }
+
+    function isValidPrivateProfile(data, userId) {
+      return data.keys().hasAll(['userId', 'fullName', 'dateOfBirth', 'nationalIdEncrypted', 'address', 'country'])
+        && data.keys().hasOnly(['userId', 'fullName', 'dateOfBirth', 'nationalIdEncrypted', 'address', 'country'])
+        && data.userId is string && data.userId == userId && data.userId.size() <= 128
+        && data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 160
+        && data.dateOfBirth is string && data.dateOfBirth.size() >= 8 && data.dateOfBirth.size() <= 20
+        && data.nationalIdEncrypted is string && data.nationalIdEncrypted.size() <= 512
+        && data.address is string && data.address.size() >= 3 && data.address.size() <= 300
+        && data.country is string && data.country.size() >= 2 && data.country.size() <= 8;
+    }
+
+    match /admins/{adminId} {
+      allow get: if isSignedIn() && isValidId(adminId) && (request.auth.uid == adminId || isSuperAdminEmail());
+      allow list: if isSuperAdminEmail();
+      allow write: if false;
+    }
+
+    match /rbac_rules/{roleId} {
+      allow get: if isAdmin() && isValidId(roleId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isVerified() && isValidId(userId) && request.auth.uid == userId && isValidUserAccount(incoming(), userId);
+      allow update: if isAdmin();
+      allow delete: if false;
+
+      match /private/profile {
+        allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+        allow list: if false;
+        allow create: if isVerified() && isValidId(userId) && request.auth.uid == userId && isValidPrivateProfile(incoming(), userId);
+        allow update: if isVerified() && isValidId(userId) && request.auth.uid == userId
+          && isValidPrivateProfile(incoming(), userId)
+          && incoming().userId == existing().userId
+          && incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'address', 'country']);
+        allow delete: if false;
+      }
+    }
+
+    // All ledger, wallet accounts, transactions, journal entries, notifications, and audit logs are strictly server-authoritative
+    match /accounts/{accountId} {
+      allow get: if isSignedIn() && isValidId(accountId) && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
+    match /transactions/{transactionId} {
+      allow get: if isSignedIn() && isValidId(transactionId) && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow get: if isSignedIn() && isValidId(notificationId) && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
+    match /journal_entries/{entryId} {
+      allow get: if isAdmin() && isValidId(entryId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /audit_logs/{logId} {
+      allow get: if isAdmin() && isValidId(logId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+  }
+}

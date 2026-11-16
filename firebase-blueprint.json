@@ -1,0 +1,152 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Core user/staff identity, approval state, and verification status",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 254 },
+        "phone": { "type": "string", "maxLength": 24 },
+        "role": { "type": "string", "enum": ["USER", "SUPPORT_AGENT", "KYC_OFFICER", "FINANCE_MAKER", "FINANCE_CHECKER", "COMPLIANCE_OFFICER", "AUDITOR", "SUPER_ADMIN"] },
+        "staffStatus": { "type": "string", "enum": ["NONE", "PENDING_APPROVAL", "APPROVED", "REJECTED"] },
+        "requestedRole": { "type": "string", "enum": ["USER", "SUPPORT_AGENT", "KYC_OFFICER", "FINANCE_MAKER", "FINANCE_CHECKER", "COMPLIANCE_OFFICER", "AUDITOR", "SUPER_ADMIN"] },
+        "status": { "type": "string", "enum": ["ACTIVE", "FROZEN", "CLOSED"] },
+        "kycStatus": { "type": "string", "enum": ["NOT_SUBMITTED", "PENDING", "APPROVED", "REJECTED", "NEEDS_MORE_INFO"] },
+        "kycTier": { "type": "integer" },
+        "legalAcceptedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "role", "staffStatus", "status", "kycStatus", "kycTier", "createdAt"]
+    },
+    "RbacRule": {
+      "title": "RbacRule",
+      "description": "Database-populated least-privilege role permission rules",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["USER", "SUPPORT_AGENT", "KYC_OFFICER", "FINANCE_MAKER", "FINANCE_CHECKER", "COMPLIANCE_OFFICER", "AUDITOR", "SUPER_ADMIN"] },
+        "description": { "type": "string", "maxLength": 400 },
+        "updatedBy": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["role", "description", "updatedBy", "updatedAt"]
+    },
+    "UserPrivateProfile": {
+      "title": "UserPrivateProfile",
+      "description": "Encrypted PII profile isolated under private subcollection",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 128 },
+        "fullName": { "type": "string", "maxLength": 160 },
+        "dateOfBirth": { "type": "string", "maxLength": 20 },
+        "nationalIdEncrypted": { "type": "string", "maxLength": 512 },
+        "address": { "type": "string", "maxLength": 300 },
+        "country": { "type": "string", "maxLength": 8 }
+      },
+      "required": ["userId", "fullName", "dateOfBirth", "nationalIdEncrypted", "address", "country"]
+    },
+    "WalletAccount": {
+      "title": "WalletAccount",
+      "description": "Multi-currency wallet with 10-digit Luhn account number",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "accountNumber": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^[0-9]{10}$" },
+        "currency": { "type": "string", "enum": ["USD", "ZWG", "ZAR"] },
+        "status": { "type": "string", "enum": ["ACTIVE", "FROZEN", "CLOSED"] }
+      },
+      "required": ["id", "userId", "accountNumber", "currency", "status"]
+    },
+    "LedgerTransaction": {
+      "title": "LedgerTransaction",
+      "description": "Immutable idempotent transaction summary",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "type": { "type": "string", "enum": ["deposit", "withdrawal", "transfer", "fee", "reversal"] },
+        "status": { "type": "string", "enum": ["PENDING", "COMPLETED", "FAILED", "REVERSED"] },
+        "amountMinor": { "type": "integer" },
+        "feeMinor": { "type": "integer" },
+        "currency": { "type": "string", "enum": ["USD", "ZWG", "ZAR"] },
+        "idempotencyKey": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["id", "type", "status", "amountMinor", "feeMinor", "currency", "idempotencyKey"]
+    },
+    "JournalEntry": {
+      "title": "JournalEntry",
+      "description": "Immutable double-entry journal entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "transactionId": { "type": "string", "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 256 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "transactionId", "description", "createdAt"]
+    },
+    "NotificationItem": {
+      "title": "NotificationItem",
+      "description": "Enforced transaction and security push/in-app/email/SMS alerts",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "channel": { "type": "string", "enum": ["SMS", "EMAIL", "PUSH", "IN_APP"] },
+        "template": { "type": "string", "maxLength": 64 },
+        "title": { "type": "string", "maxLength": 160 },
+        "body": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "channel", "template", "title", "body", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Append-only security and admin audit trail",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "actorId": { "type": "string", "maxLength": 128 },
+        "actorType": { "type": "string", "maxLength": 32 },
+        "action": { "type": "string", "maxLength": 128 },
+        "entity": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "actorId", "actorType", "action", "entity", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "User and staff account metadata"
+    },
+    "/users/{userId}/private/profile": {
+      "schema": { "$ref": "#/entities/UserPrivateProfile" },
+      "description": "Isolated PII and encrypted national ID"
+    },
+    "/rbac_rules/{role}": {
+      "schema": { "$ref": "#/entities/RbacRule" },
+      "description": "Database-enforced RBAC role permission rules"
+    },
+    "/accounts/{accountId}": {
+      "schema": { "$ref": "#/entities/WalletAccount" },
+      "description": "Multi-currency wallet accounts"
+    },
+    "/transactions/{transactionId}": {
+      "schema": { "$ref": "#/entities/LedgerTransaction" },
+      "description": "Immutable transaction records"
+    },
+    "/journal_entries/{entryId}": {
+      "schema": { "$ref": "#/entities/JournalEntry" },
+      "description": "Immutable double-entry journal entries"
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/NotificationItem" },
+      "description": "Transaction and security notification records"
+    },
+    "/audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Append-only audit logs"
+    }
+  }
+}
