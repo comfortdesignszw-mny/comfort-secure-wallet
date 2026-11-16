@@ -1,7 +1,10 @@
 name = "comfort-secure-wallet"
-compatibility_date = "2025-01-01"
-compatibility_flags = ["nodejs_compat"]
-pages_build_output_dir = "dist"
+compatibility_date = "2026-11-16"
+
+[assets]
+directory = "./dist"
+not_found_handling = "single-page-application"
+
 
 # Configure encrypted secrets directly in Cloudflare Pages Dashboard -> Settings -> Variables and Secrets:
 #   - WALLET_JWT_SECRET
