@@ -169,6 +169,7 @@ export function createV1Router(): Router {
         requiresPinSetup: result.tokens.requiresPinSetup,
         otpTarget: result.otpTarget,
         otpChannel: result.otpChannel,
+        otpSent: result.otpSent,
         devOtpPreview: result.devOtpPreview,
       });
     } catch (err) {
@@ -196,6 +197,7 @@ export function createV1Router(): Router {
         requiresPinSetup: result.tokens.requiresPinSetup,
         otpTarget: result.otpTarget,
         otpChannel: result.otpChannel,
+        otpSent: result.otpSent,
         devOtpPreview: result.devOtpPreview,
       });
     } catch (err) {

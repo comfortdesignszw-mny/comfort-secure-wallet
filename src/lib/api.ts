@@ -145,9 +145,13 @@ export async function apiFetch<T = unknown>(
   const json = await res.json().catch(() => ({}));
   if (!res.ok) {
     const errObj = json?.error || {};
+    const fallbackMessage =
+      res.status === 405
+        ? 'API endpoint rejected POST (HTTP 405). Ensure Cloudflare Pages Functions (/functions/api/[[path]].ts) are deployed and API_ORIGIN does not point back to your static site.'
+        : `Request failed (${res.status})`;
     throw new ApiError(
-      errObj.code || 'API_ERROR',
-      errObj.message || `Request failed (${res.status})`,
+      errObj.code || (res.status === 405 ? 'METHOD_NOT_ALLOWED' : 'API_ERROR'),
+      errObj.message || fallbackMessage,
       res.status,
       errObj.correlationId,
     );

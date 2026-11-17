@@ -156,7 +156,7 @@ class AuthService {
     ip?: string;
     userAgent?: string;
     legalAccepted?: boolean;
-  }): Promise<{ user: Omit<UserRecord, 'passwordHash'>; otpTarget: string; otpChannel: 'SMS' | 'EMAIL'; devOtpPreview?: string; tokens: AuthTokensResult }> {
+  }): Promise<{ user: Omit<UserRecord, 'passwordHash'>; otpTarget: string; otpChannel: 'SMS' | 'EMAIL'; otpSent: boolean; devOtpPreview?: string; tokens: AuthTokensResult }> {
     if (params.legalAccepted === false) {
       throw new Error('LEGAL_CONFIRMATION_REQUIRED: You must read and accept the financial Terms of Use and Privacy Policy.');
     }
@@ -175,6 +175,12 @@ class AuthService {
 
     const now = new Date().toISOString();
     const passwordHash = await hashPassword(params.password);
+    const otpChannel: 'SMS' | 'EMAIL' = phone ? 'SMS' : 'EMAIL';
+    const otpTarget = (phone || email)!;
+    const isProd = process.env.NODE_ENV === 'production';
+    const hasLiveOtp = otpChannel === 'EMAIL' ? Boolean(process.env.RESEND_API_KEY) : Boolean(process.env.AFRICASTALKING_API_KEY);
+    const otpSent = !isProd || hasLiveOtp;
+
     const user: UserRecord = {
       id: `usr_${randomUUID()}`,
       email,
@@ -188,8 +194,8 @@ class AuthService {
       freezeReason: null,
       kycStatus: KycStatus.NOT_SUBMITTED,
       kycTier: 0,
-      emailVerified: false,
-      phoneVerified: false,
+      emailVerified: !otpSent && otpChannel === 'EMAIL',
+      phoneVerified: !otpSent && otpChannel === 'SMS',
       totpEnabled: false,
       legalAcceptedAt: now,
       createdAt: now,
@@ -197,14 +203,14 @@ class AuthService {
     dbStore.users.set(user.id, user);
     dbStore.mirrorDoc('users', user.id, this.sanitizeUser(user));
 
-    const otpChannel: 'SMS' | 'EMAIL' = phone ? 'SMS' : 'EMAIL';
-    const otpTarget = (phone || email)!;
-    const otp = await this.sendOtp({
-      userId: user.id,
-      target: otpTarget,
-      channel: otpChannel,
-      purpose: 'REGISTER',
-    });
+    const otp = otpSent
+      ? await this.sendOtp({
+          userId: user.id,
+          target: otpTarget,
+          channel: otpChannel,
+          purpose: 'REGISTER',
+        })
+      : { devPreviewCode: undefined };
 
     const tokens = this.createSession(user, {
       deviceFingerprint: params.deviceFingerprint || `fp_${randomUUID().slice(0, 8)}`,
@@ -229,6 +235,7 @@ class AuthService {
       user: this.sanitizeUser(user),
       otpTarget,
       otpChannel,
+      otpSent,
       devOtpPreview: otp.devPreviewCode,
       tokens,
     };
@@ -250,7 +257,7 @@ class AuthService {
     deviceLabel?: string;
     ip?: string;
     userAgent?: string;
-  }): Promise<{ user: Omit<UserRecord, 'passwordHash'>; otpTarget: string; otpChannel: 'SMS' | 'EMAIL'; devOtpPreview?: string; tokens: AuthTokensResult }> {
+  }): Promise<{ user: Omit<UserRecord, 'passwordHash'>; otpTarget: string; otpChannel: 'SMS' | 'EMAIL'; otpSent: boolean; devOtpPreview?: string; tokens: AuthTokensResult }> {
     if (!params.legalAccepted) {
       throw new Error('LEGAL_CONFIRMATION_REQUIRED: You must confirm the Terms of Use and Privacy Policy.');
     }
@@ -278,6 +285,12 @@ class AuthService {
 
     const now = new Date().toISOString();
     const passwordHash = await hashPassword(params.password);
+    const otpChannel: 'SMS' | 'EMAIL' = email ? 'EMAIL' : 'SMS';
+    const otpTarget = (email || phone)!;
+    const isProd = process.env.NODE_ENV === 'production';
+    const hasLiveOtp = otpChannel === 'EMAIL' ? Boolean(process.env.RESEND_API_KEY) : Boolean(process.env.AFRICASTALKING_API_KEY);
+    const otpSent = !isProd || hasLiveOtp;
+
     const user: UserRecord = {
       id: `stf_${randomUUID()}`,
       email,
@@ -291,8 +304,8 @@ class AuthService {
       freezeReason: null,
       kycStatus: KycStatus.APPROVED,
       kycTier: 2,
-      emailVerified: false,
-      phoneVerified: false,
+      emailVerified: !otpSent && otpChannel === 'EMAIL',
+      phoneVerified: !otpSent && otpChannel === 'SMS',
       totpEnabled: true,
       legalAcceptedAt: now,
       createdAt: now,
@@ -309,14 +322,14 @@ class AuthService {
     });
     dbStore.mirrorDoc('users', user.id, this.sanitizeUser(user));
 
-    const otpChannel: 'SMS' | 'EMAIL' = email ? 'EMAIL' : 'SMS';
-    const otpTarget = (email || phone)!;
-    const otp = await this.sendOtp({
-      userId: user.id,
-      target: otpTarget,
-      channel: otpChannel,
-      purpose: 'REGISTER',
-    });
+    const otp = otpSent
+      ? await this.sendOtp({
+          userId: user.id,
+          target: otpTarget,
+          channel: otpChannel,
+          purpose: 'REGISTER',
+        })
+      : { devPreviewCode: undefined };
 
     const tokens = this.createSession(user, {
       deviceFingerprint: params.deviceFingerprint || `stf_${randomUUID().slice(0, 8)}`,
@@ -347,6 +360,7 @@ class AuthService {
       user: this.sanitizeUser(user),
       otpTarget,
       otpChannel,
+      otpSent,
       devOtpPreview: otp.devPreviewCode,
       tokens,
     };

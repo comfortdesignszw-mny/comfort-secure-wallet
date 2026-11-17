@@ -52,7 +52,26 @@ export class AfricasTalkingSmsAdapter implements SmsAdapter {
 
 export class TransactionalEmailAdapter implements EmailAdapter {
   readonly providerName = 'Resend/SES Adapter';
-  async sendEmail(_email: string, _subject: string, _body: string): Promise<{ providerId: string }> {
+  async sendEmail(email: string, subject: string, body: string): Promise<{ providerId: string }> {
+    const apiKey = process.env.RESEND_API_KEY;
+    if (apiKey && process.env.NODE_ENV === 'production') {
+      const res = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          from: process.env.RESEND_FROM_EMAIL || 'Comfort Secure Wallet <no-reply@comfortwallet.zw>',
+          to: [email],
+          subject,
+          text: body,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`Transactional email delivery failed with HTTP ${res.status}`);
+      }
+    }
     return { providerId: `em_${randomUUID().slice(0, 12)}` };
   }
 }

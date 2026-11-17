@@ -16,10 +16,10 @@ export function createApiApp() {
       contentSecurityPolicy: {
         directives: {
           defaultSrc: ["'self'"],
-          scriptSrc: ["'self'", "'unsafe-inline'", 'blob:', 'https://apis.google.com', 'https://www.gstatic.com', 'https://accounts.google.com'],
-          styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+          scriptSrc: ["'self'", "'unsafe-inline'", 'blob:', 'https://apis.google.com', 'https://www.gstatic.com', 'https://accounts.google.com', 'https://*.firebaseapp.com'],
+          styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com', 'https://accounts.google.com'],
           fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
-          imgSrc: ["'self'", 'data:', 'blob:', 'https://*.googleusercontent.com'],
+          imgSrc: ["'self'", 'data:', 'blob:', 'https://*.googleusercontent.com', 'https:'],
           workerSrc: ["'self'", 'blob:'],
           connectSrc: [
             "'self'",
@@ -27,10 +27,12 @@ export function createApiApp() {
             'wss:',
             'https://*.googleapis.com',
             'https://*.firebaseio.com',
+            'https://*.firebaseapp.com',
             'https://identitytoolkit.googleapis.com',
             'https://securetoken.googleapis.com',
+            'https://accounts.google.com',
           ],
-          frameSrc: ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com'],
+          frameSrc: ["'self'", 'https://*.firebaseapp.com', 'https://accounts.google.com', 'https://*.google.com'],
           frameAncestors: [
             "'self'",
             'https://aistudio.google.com',

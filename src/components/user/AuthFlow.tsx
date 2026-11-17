@@ -63,9 +63,51 @@ export const AuthFlow: React.FC<AuthFlowProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [pendingGoogleIdToken, setPendingGoogleIdToken] = useState<string | null>(null);
+
   useEffect(() => {
     setRememberedHints(getRememberedLogins('wallet'));
   }, []);
+
+  const exchangeGoogleToken = async (idToken: string, acceptedLegal: boolean) => {
+    const res = await apiFetch<{
+      accessToken: string;
+      user: { email?: string | null };
+      requiresPinSetup?: boolean;
+    }>('/auth/google', {
+      method: 'POST',
+      body: JSON.stringify({
+        idToken,
+        legalAccepted: acceptedLegal,
+        deviceFingerprint: 'pwa_google_web',
+        deviceLabel: 'Google Account',
+      }),
+    });
+    setPendingGoogleIdToken(null);
+    setAccessToken(res.accessToken);
+    if (res.user?.email) {
+      persistHint('email', res.user.email);
+    }
+    void ensurePushSubscription();
+    if (res.requiresPinSetup) {
+      setMode('pin');
+    } else {
+      await onAuthenticated();
+    }
+  };
+
+  useEffect(() => {
+    if (legalAccepted && pendingGoogleIdToken) {
+      const token = pendingGoogleIdToken;
+      setLoading(true);
+      setError(null);
+      void exchangeGoogleToken(token, true)
+        .catch((err) => {
+          setError(err instanceof Error ? err.message : 'Google sign-in failed');
+        })
+        .finally(() => setLoading(false));
+    }
+  }, [legalAccepted, pendingGoogleIdToken]);
 
   const persistHint = (ch: 'email' | 'phone', id: string) => {
     rememberLoginHint({ identifier: id, channel: ch, surface: 'wallet' });
@@ -160,6 +202,7 @@ export const AuthFlow: React.FC<AuthFlowProps> = ({
         accessToken: string;
         otpTarget: string;
         otpChannel: 'SMS' | 'EMAIL';
+        otpSent?: boolean;
       }>('/auth/register', {
         method: 'POST',
         body: JSON.stringify(payload),
@@ -168,7 +211,11 @@ export const AuthFlow: React.FC<AuthFlowProps> = ({
       persistHint(channel, channel === 'email' ? email : phone);
       setOtpTarget(res.otpTarget);
       setOtpChannel(res.otpChannel);
-      setMode('otp');
+      if (res.otpSent === false) {
+        setMode('pin');
+      } else {
+        setMode('otp');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Registration failed');
     } finally {
@@ -182,32 +229,27 @@ export const AuthFlow: React.FC<AuthFlowProps> = ({
       onOpenLegalDoc('terms');
       return;
     }
-    setLoading(true);
     setError(null);
     try {
-      const idToken = await signInWithGooglePopup();
-      const res = await apiFetch<{
-        accessToken: string;
-        user: { email?: string | null };
-        requiresPinSetup?: boolean;
-      }>('/auth/google', {
-        method: 'POST',
-        body: JSON.stringify({
-          idToken,
-          legalAccepted,
-          deviceFingerprint: 'pwa_google_web',
-          deviceLabel: 'Google Account',
-        }),
+      // Trigger Google signInWithPopup immediately inside the click gesture before any async wait
+      const popupPromise = signInWithGooglePopup({
+        surface: 'wallet',
+        legalAccepted,
       });
-      setAccessToken(res.accessToken);
-      if (res.user?.email) {
-        persistHint('email', res.user.email);
+      setLoading(true);
+      const idToken = await popupPromise;
+      if (idToken === '__REDIRECTING__') {
+        return;
       }
-      void ensurePushSubscription();
-      if (res.requiresPinSetup) {
-        setMode('pin');
-      } else {
-        await onAuthenticated();
+      try {
+        await exchangeGoogleToken(idToken, legalAccepted);
+      } catch (apiErr: unknown) {
+        if ((apiErr as { code?: string })?.code === 'LEGAL_CONFIRMATION_REQUIRED') {
+          setPendingGoogleIdToken(idToken);
+          onOpenLegalDoc('terms');
+          return;
+        }
+        throw apiErr;
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Google sign-in cancelled or failed');

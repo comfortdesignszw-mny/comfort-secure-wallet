@@ -1,54 +1,52 @@
-interface CloudflareEnv {
-  API_ORIGIN?: string;
-  WALLET_JWT_SECRET?: string;
-  WALLET_REFRESH_SECRET?: string;
-  WALLET_PIN_PEPPER?: string;
-  WALLET_FIELD_ENCRYPTION_KEY?: string;
-  WALLET_SIGNED_URL_SECRET?: string;
-  SUPER_ADMIN_EMAIL?: string;
-}
+import { CloudflareEnv, handleEdgeApiRequest } from '../../src/edge/wallet-edge-app.ts';
 
 interface CloudflarePagesContext {
   request: Request;
   env: CloudflareEnv;
 }
 
+function shouldProxyToExternalOrigin(apiOriginRaw: string | undefined, incomingUrl: URL): string | null {
+  const trimmed = (apiOriginRaw || '').trim().replace(/\/+$/, '');
+  if (!trimmed) return null;
+  try {
+    const parsed = new URL(trimmed);
+    // Guard against self-looping onto the same Cloudflare Pages host (which triggers HTTP 405 on static origin)
+    if (parsed.host.toLowerCase() === incomingUrl.host.toLowerCase()) {
+      return null;
+    }
+    return trimmed;
+  } catch {
+    return null;
+  }
+}
+
 export async function onRequest(context: CloudflarePagesContext): Promise<Response> {
   const { request, env } = context;
-  const apiOrigin = (env.API_ORIGIN || '').trim().replace(/\/+$/, '');
-
-  if (!apiOrigin) {
-    return new Response(
-      JSON.stringify({
-        error: {
-          code: 'API_ORIGIN_UNCONFIGURED',
-          message:
-            'Configure API_ORIGIN and wallet secrets (WALLET_JWT_SECRET, WALLET_REFRESH_SECRET, WALLET_PIN_PEPPER) in Cloudflare Pages Environment Variables.',
-        },
-      }),
-      {
-        status: 503,
-        headers: { 'Content-Type': 'application/json' },
-      },
-    );
-  }
-
   const incomingUrl = new URL(request.url);
-  const targetUrl = `${apiOrigin}${incomingUrl.pathname}${incomingUrl.search}`;
+  const externalOrigin = shouldProxyToExternalOrigin(env.API_ORIGIN, incomingUrl);
 
-  const headers = new Headers(request.headers);
-  headers.set('X-Forwarded-Host', incomingUrl.host);
-  headers.set('X-Forwarded-Proto', incomingUrl.protocol.replace(':', ''));
+  if (externalOrigin) {
+    const targetUrl = `${externalOrigin}${incomingUrl.pathname}${incomingUrl.search}`;
+    const headers = new Headers(request.headers);
+    headers.set('X-Forwarded-Host', incomingUrl.host);
+    headers.set('X-Forwarded-Proto', incomingUrl.protocol.replace(':', ''));
 
-  const init: RequestInit = {
-    method: request.method,
-    headers,
-    redirect: 'manual',
-  };
+    const init: RequestInit = {
+      method: request.method,
+      headers,
+      redirect: 'manual',
+    };
 
-  if (request.method !== 'GET' && request.method !== 'HEAD') {
-    init.body = request.body;
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      init.body = request.body;
+    }
+
+    const upstream = await fetch(targetUrl, init);
+    // If upstream mistakenly points at static hosting returning 405, handle natively in Cloudflare Edge
+    if (upstream.status !== 405) {
+      return upstream;
+    }
   }
 
-  return fetch(targetUrl, init);
+  return handleEdgeApiRequest(request, env);
 }

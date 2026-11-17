@@ -76,10 +76,53 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [pendingGoogleIdToken, setPendingGoogleIdToken] = useState<string | null>(null);
+
   const persistHint = (ch: 'email' | 'phone', id: string) => {
     rememberLoginHint({ identifier: id, channel: ch, surface: 'admin' });
     setRememberedHints(getRememberedLogins('admin'));
   };
+
+  const exchangeStaffGoogleToken = async (idToken: string, acceptedLegal: boolean) => {
+    const res = await apiFetch<{
+      accessToken: string;
+      user: { email?: string | null };
+      requiresPinSetup?: boolean;
+    }>('/auth/staff/google', {
+      method: 'POST',
+      body: JSON.stringify({
+        idToken,
+        requestedRole,
+        legalAccepted: acceptedLegal,
+        deviceFingerprint: 'admin_console_google',
+        deviceLabel: 'Staff Google Sign-In',
+      }),
+    });
+    setPendingGoogleIdToken(null);
+    setAccessToken(res.accessToken);
+    if (res.user?.email) {
+      persistHint('email', res.user.email);
+    }
+    void ensurePushSubscription();
+    if (res.requiresPinSetup) {
+      setMode('pin_setup');
+    } else {
+      await onAuthenticated();
+    }
+  };
+
+  React.useEffect(() => {
+    if (legalAccepted && pendingGoogleIdToken) {
+      const token = pendingGoogleIdToken;
+      setLoading(true);
+      setError(null);
+      void exchangeStaffGoogleToken(token, true)
+        .catch((err) => {
+          setError(err instanceof Error ? err.message : 'Google Staff Sign-In failed');
+        })
+        .finally(() => setLoading(false));
+    }
+  }, [legalAccepted, pendingGoogleIdToken]);
 
   const handlePasswordOrPinLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -147,6 +190,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({
         accessToken: string;
         otpTarget: string;
         otpChannel: 'SMS' | 'EMAIL';
+        otpSent?: boolean;
       }>('/auth/staff/register', {
         method: 'POST',
         body: JSON.stringify({
@@ -160,7 +204,11 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({
       setOtpTarget(res.otpTarget);
       setOtpChannel(res.otpChannel);
       setOtpCode('');
-      setMode('otp_register');
+      if (res.otpSent === false) {
+        setMode('pin_setup');
+      } else {
+        setMode('otp_register');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Staff registration failed');
     } finally {
@@ -174,33 +222,27 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({
       onOpenLegalDoc('terms');
       return;
     }
-    setLoading(true);
     setError(null);
     try {
-      const idToken = await signInWithGooglePopup();
-      const res = await apiFetch<{
-        accessToken: string;
-        user: { email?: string | null };
-        requiresPinSetup?: boolean;
-      }>('/auth/staff/google', {
-        method: 'POST',
-        body: JSON.stringify({
-          idToken,
-          requestedRole,
-          legalAccepted,
-          deviceFingerprint: 'admin_console_google',
-          deviceLabel: 'Staff Google Sign-In',
-        }),
+      const popupPromise = signInWithGooglePopup({
+        surface: 'admin',
+        legalAccepted,
+        requestedRole,
       });
-      setAccessToken(res.accessToken);
-      if (res.user?.email) {
-        persistHint('email', res.user.email);
+      setLoading(true);
+      const idToken = await popupPromise;
+      if (idToken === '__REDIRECTING__') {
+        return;
       }
-      void ensurePushSubscription();
-      if (res.requiresPinSetup) {
-        setMode('pin_setup');
-      } else {
-        await onAuthenticated();
+      try {
+        await exchangeStaffGoogleToken(idToken, legalAccepted);
+      } catch (apiErr: unknown) {
+        if ((apiErr as { code?: string })?.code === 'LEGAL_CONFIRMATION_REQUIRED') {
+          setPendingGoogleIdToken(idToken);
+          onOpenLegalDoc('terms');
+          return;
+        }
+        throw apiErr;
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Google Staff Sign-In failed');

@@ -27,6 +27,7 @@ import {
   setViewStepUpToken,
   tryRefreshSession,
 } from './lib/api.ts';
+import { consumeGoogleRedirectResult } from './lib/firebase.ts';
 import { dispatchTransactionPushAlerts, ensurePushSubscription } from './lib/pushNotifications.ts';
 import { LegalDocId, LegalDocsModal } from './components/LegalDocsModal.tsx';
 import { OfflineIndicator } from './components/OfflineIndicator.tsx';
@@ -139,6 +140,31 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
+      try {
+        const redirectResult = await consumeGoogleRedirectResult();
+        if (redirectResult?.idToken) {
+          const isAdminSurface = redirectResult.meta?.surface === 'admin';
+          if (isAdminSurface) setSurface('admin');
+          const endpoint = isAdminSurface ? '/auth/staff/google' : '/auth/google';
+          const res = await apiFetch<{ accessToken: string }>(endpoint, {
+            method: 'POST',
+            body: JSON.stringify({
+              idToken: redirectResult.idToken,
+              legalAccepted: redirectResult.meta?.legalAccepted ?? true,
+              requestedRole: redirectResult.meta?.requestedRole,
+              deviceFingerprint: isAdminSurface ? 'admin_console_google' : 'pwa_google_web',
+              deviceLabel: 'Google Account',
+            }),
+          });
+          setAccessToken(res.accessToken);
+          await loadWalletData();
+          setBooting(false);
+          return;
+        }
+      } catch {
+        // Fall through to normal session boot
+      }
+
       const refreshed = await tryRefreshSession();
       if (refreshed) {
         await loadWalletData();
