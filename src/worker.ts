@@ -56,9 +56,14 @@ export default {
     if (env.ASSETS) {
       const assetRes = await env.ASSETS.fetch(request);
       const contentType = assetRes.headers.get('content-type') || '';
-      if (contentType.includes('text/html')) {
+      const isServiceWorker =
+        incomingUrl.pathname === '/sw.js' || incomingUrl.pathname === '/registerSW.js';
+      if (contentType.includes('text/html') || isServiceWorker) {
         const headers = new Headers(assetRes.headers);
-        headers.set('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+        headers.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+        if (contentType.includes('text/html')) {
+          headers.set('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+        }
         return new Response(assetRes.body, {
           status: assetRes.status,
           statusText: assetRes.statusText,
