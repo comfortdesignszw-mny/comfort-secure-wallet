@@ -147,7 +147,7 @@ export async function apiFetch<T = unknown>(
     const errObj = json?.error || {};
     const fallbackMessage =
       res.status === 405
-        ? 'API endpoint rejected POST (HTTP 405). Ensure Cloudflare Pages Functions (/functions/api/[[path]].ts) are deployed and API_ORIGIN does not point back to your static site.'
+        ? 'API endpoint rejected POST (HTTP 405). Ensure Cloudflare Worker routing (wrangler.toml main + run_worker_first) or Pages Functions are active and API_ORIGIN does not point back to your frontend host.'
         : `Request failed (${res.status})`;
     throw new ApiError(
       errObj.code || (res.status === 405 ? 'METHOD_NOT_ALLOWED' : 'API_ERROR'),

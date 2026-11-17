@@ -872,7 +872,8 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
 
   await hydrateVaultCookie(request, secrets.encKey);
 
-  const path = url.pathname.replace(/^\/api\/v1/, '') || '/';
+  const rawPath = url.pathname.replace(/^\/api\/v1/, '') || '/';
+  const path = rawPath.length > 1 ? rawPath.replace(/\/+$/, '') : '/';
   const method = request.method.toUpperCase();
 
   let body: Record<string, unknown> = {};

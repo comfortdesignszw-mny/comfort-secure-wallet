@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { onRequest } from '../functions/api/[[path]].ts';
+import worker from '../src/worker.ts';
 import { Role } from '../src/shared/types.ts';
 
 function extractCookieHeader(res: Response, existingCookieHeader = ''): string {
@@ -23,7 +24,7 @@ function extractCookieHeader(res: Response, existingCookieHeader = ''): string {
   return [...map.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
-describe('Cloudflare Pages Edge API (/functions/api/[[path]].ts)', () => {
+describe('Cloudflare Pages & Workers Edge API', () => {
   const env = {
     WALLET_JWT_SECRET: 'test-jwt-secret-123',
     WALLET_REFRESH_SECRET: 'test-refresh-secret-456',
@@ -32,7 +33,7 @@ describe('Cloudflare Pages Edge API (/functions/api/[[path]].ts)', () => {
     API_ORIGIN: 'https://comfort-secure-wallet.pages.dev',
   };
 
-  it('registers user, sets PIN, persists via encrypted vault cookie, and signs in with 6-digit PIN without 405', async () => {
+  it('registers user, sets PIN, persists via encrypted vault cookie, and signs in with 6-digit PIN without 405 (Pages Function)', async () => {
     const regReq = new Request('https://comfort-secure-wallet.pages.dev/api/v1/auth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -89,6 +90,38 @@ describe('Cloudflare Pages Edge API (/functions/api/[[path]].ts)', () => {
     expect(pinLoginRes.status).toBe(200);
     const pinLoginJson = (await pinLoginRes.json()) as { accessToken: string };
     expect(pinLoginJson.accessToken).toBeTruthy();
+  });
+
+  it('routes /api/* via Cloudflare Worker entrypoint (src/worker.ts) without 405 and injects COOP on HTML assets', async () => {
+    const workerEnv = {
+      ...env,
+      API_ORIGIN: 'https://comfort-secure-wallet.workers.dev',
+      ASSETS: {
+        async fetch() {
+          return new Response('<html><body>App</body></html>', {
+            status: 200,
+            headers: { 'Content-Type': 'text/html; charset=utf-8' },
+          });
+        },
+      },
+    };
+
+    const regReq = new Request('https://comfort-secure-wallet.workers.dev/api/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'worker.customer@wallet.zw',
+        password: 'StrongWorkerPassword!2026',
+        fullName: 'Worker Customer',
+        legalAccepted: true,
+      }),
+    });
+    const regRes = await worker.fetch(regReq, workerEnv);
+    expect(regRes.status).toBe(201);
+
+    const htmlRes = await worker.fetch(new Request('https://comfort-secure-wallet.workers.dev/'), workerEnv);
+    expect(htmlRes.status).toBe(200);
+    expect(htmlRes.headers.get('Cross-Origin-Opener-Policy')).toBe('same-origin-allow-popups');
   });
 
   it('auto-provisions comfort.designszw@gmail.com as APPROVED SUPER_ADMIN on edge staff signup', async () => {
