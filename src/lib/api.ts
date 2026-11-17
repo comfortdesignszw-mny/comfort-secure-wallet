@@ -73,7 +73,16 @@ export function getRememberedLogins(surface?: 'wallet' | 'admin'): RememberedLog
   if (typeof window === 'undefined') return [];
   try {
     const raw = window.localStorage.getItem(REMEMBERED_KEY);
-    const list: RememberedLoginHint[] = raw ? JSON.parse(raw) : [];
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    const list: RememberedLoginHint[] = Array.isArray(parsed)
+      ? parsed.filter(
+          (x): x is RememberedLoginHint =>
+            Boolean(x) &&
+            typeof x === 'object' &&
+            typeof (x as RememberedLoginHint).identifier === 'string' &&
+            ((x as RememberedLoginHint).channel === 'email' || (x as RememberedLoginHint).channel === 'phone'),
+        )
+      : [];
     const filtered = surface ? list.filter((x) => x.surface === surface) : list;
     return filtered.slice(0, 4);
   } catch {

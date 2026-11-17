@@ -1601,7 +1601,22 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     }
 
     if (method === 'GET' && path === '/accounts') {
-      const accounts = [...edgeState.accounts.values()].filter((a) => a.userId === user.id);
+      const tierScope = user.kycTier >= 2 ? 'TIER_2' : 'TIER_1';
+      const accounts = [...edgeState.accounts.values()]
+        .filter((a) => a.userId === user.id)
+        .map((acc) => {
+          const rule = edgeState.limitRules.get(`lim_${tierScope}_${acc.currency}`);
+          return {
+            ...acc,
+            withdrawalLimits: {
+              perTxnMaxMinor: rule?.perTxnMaxMinor ?? 10000,
+              dailyMaxMinor: rule?.dailyMaxMinor ?? 10000,
+              monthlyMaxMinor: rule?.monthlyMaxMinor ?? 100000,
+              dailyUsedMinor: 0,
+              monthlyUsedMinor: 0,
+            },
+          };
+        });
       return jsonResponse({ accounts });
     }
 
@@ -1950,25 +1965,84 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       const requirePerm = (p: Permission) => perms.includes(p);
 
       if (method === 'GET' && path === '/admin/overview') {
+        const balancesByCurrency: Record<
+          string,
+          { userLiabilitiesMinor: number; withdrawalHoldMinor: number; feeRevenueMinor: number; bankSettlementMinor: number }
+        > = {};
+        for (const currency of [Currency.USD, Currency.ZWG, Currency.ZAR]) {
+          let userLiabilitiesMinor = 0;
+          for (const la of edgeState.ledgerAccounts.values()) {
+            if (la.currency === currency && la.type === LedgerAccountType.USER_WALLET) {
+              userLiabilitiesMinor += la.cachedBalanceMinor;
+            }
+          }
+          const hold = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.WITHDRAWAL_HOLD}_${currency}`)?.cachedBalanceMinor ?? 0;
+          const fee = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.FEE_REVENUE}_${currency}`)?.cachedBalanceMinor ?? 0;
+          const bank = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.BANK_SETTLEMENT}_${currency}`)?.cachedBalanceMinor ?? 0;
+          balancesByCurrency[currency] = {
+            userLiabilitiesMinor,
+            withdrawalHoldMinor: hold,
+            feeRevenueMinor: fee,
+            bankSettlementMinor: bank,
+          };
+        }
+
         return jsonResponse({
-          usersCount: edgeState.users.size,
-          accountsCount: edgeState.accounts.size,
-          pendingKycCount: [...edgeState.users.values()].filter((u) => u.kycStatus === KycStatus.PENDING).length,
-          pendingDepositsCount: [...edgeState.depositRequests.values()].filter((d) => d.status === DepositStatus.PENDING || d.status === DepositStatus.MAKER_APPROVED).length,
-          pendingWithdrawalsCount: [...edgeState.withdrawalRequests.values()].filter((w) => w.status === WithdrawalStatus.PENDING || w.status === WithdrawalStatus.MAKER_APPROVED || w.status === WithdrawalStatus.CHECKER_APPROVED).length,
-          openRiskFlagsCount: [...edgeState.riskFlags.values()].filter((r) => !r.resolvedAt).length,
+          totalUsers: [...edgeState.users.values()].filter((u) => u.role === Role.USER).length,
+          totalTransactions: edgeState.transactions.size,
+          pendingKyc: [...edgeState.users.values()].filter(
+            (u) => u.kycStatus === KycStatus.PENDING || u.kycStatus === KycStatus.NEEDS_MORE_INFO,
+          ).length,
+          pendingDeposits: [...edgeState.depositRequests.values()].filter(
+            (d) => d.status === DepositStatus.PENDING || d.status === DepositStatus.MAKER_APPROVED,
+          ).length,
+          pendingWithdrawals: [...edgeState.withdrawalRequests.values()].filter(
+            (w) =>
+              w.status === WithdrawalStatus.PENDING ||
+              w.status === WithdrawalStatus.MAKER_APPROVED ||
+              w.status === WithdrawalStatus.CHECKER_APPROVED,
+          ).length,
+          openRiskFlags: [...edgeState.riskFlags.values()].filter((r) => !r.resolvedAt).length,
+          pendingApprovals: [...edgeState.approvals.values()].filter((a) => a.status === 'PENDING').length,
+          ledgerInvariant: { valid: true },
+          balancesByCurrency,
         });
       }
 
       if (method === 'GET' && path === '/admin/kyc') {
         if (!requirePerm('kyc:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing permission kyc:read', correlationId);
-        const queue = [...edgeState.users.values()]
-          .filter((u) => !ADMIN_ROLES.includes(u.role))
-          .map((u) => ({
-            user: sanitizeUser(u),
-            profile: edgeState.profiles.get(u.id) ?? null,
-            documents: [...edgeState.kycDocs.values()].filter((d) => d.userId === u.id),
-          }));
+        const queue = await Promise.all(
+          [...edgeState.users.values()]
+            .filter((u) => !ADMIN_ROLES.includes(u.role) && (u.kycStatus === KycStatus.PENDING || u.kycStatus === KycStatus.NEEDS_MORE_INFO))
+            .map(async (u) => {
+              const prof = edgeState.profiles.get(u.id);
+              let nationalIdNumber = '';
+              if (prof?.nationalIdEncrypted) {
+                try {
+                  nationalIdNumber = await decryptFieldEdge(prof.nationalIdEncrypted, secrets.encKey);
+                } catch {
+                  nationalIdNumber = 'REDACTED';
+                }
+              }
+              return {
+                userId: u.id,
+                email: u.email,
+                phone: u.phone,
+                kycStatus: u.kycStatus,
+                createdAt: u.createdAt,
+                profile: prof
+                  ? {
+                      fullName: prof.fullName,
+                      dateOfBirth: prof.dateOfBirth,
+                      nationalIdNumber,
+                      address: prof.address,
+                      country: prof.country,
+                    }
+                  : null,
+                documents: [...edgeState.kycDocs.values()].filter((d) => d.userId === u.id),
+              };
+            }),
+        );
         return jsonResponse({ queue });
       }
 
@@ -1985,12 +2059,24 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
           target.kycTier = 1;
           provisionWalletsForUser(target.id);
         }
+        await kvSyncUser(env, target.id);
         return jsonResponse({ user: sanitizeUser(target) });
       }
 
       if (method === 'GET' && path === '/admin/deposits') {
         if (!requirePerm('deposits:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing permission deposits:read', correlationId);
-        return jsonResponse({ deposits: [...edgeState.depositRequests.values()] });
+        const deposits = [...edgeState.depositRequests.values()]
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .map((d) => {
+            const target = edgeState.users.get(d.userId);
+            const prof = edgeState.profiles.get(d.userId);
+            return {
+              ...d,
+              userEmail: target?.email ?? null,
+              userName: prof?.fullName || target?.email || 'Unknown',
+            };
+          });
+        return jsonResponse({ deposits });
       }
 
       const depApproveMatch = path.match(/^\/admin\/deposits\/([^/]+)\/approve$/);
@@ -2033,18 +2119,41 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
 
       if (method === 'GET' && path === '/admin/withdrawals') {
         if (!requirePerm('withdrawals:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing permission withdrawals:read', correlationId);
-        return jsonResponse({ withdrawals: [...edgeState.withdrawalRequests.values()] });
+        const withdrawals = [...edgeState.withdrawalRequests.values()]
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .map((w) => {
+            const target = edgeState.users.get(w.userId);
+            const prof = edgeState.profiles.get(w.userId);
+            return {
+              ...w,
+              destinationDecrypted: w.destinationPreview,
+              userEmail: target?.email ?? null,
+              userName: prof?.fullName || target?.email || 'Unknown',
+            };
+          });
+        return jsonResponse({ withdrawals });
       }
 
       if (method === 'GET' && path === '/admin/users') {
         if (!requirePerm('users:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing users:read', correlationId);
         const users = [...edgeState.users.values()]
           .filter((u) => !ADMIN_ROLES.includes(u.role))
-          .map((u) => ({
-            user: sanitizeUser(u),
-            profile: edgeState.profiles.get(u.id) ?? null,
-            accounts: [...edgeState.accounts.values()].filter((a) => a.userId === u.id),
-          }));
+          .map((u) => {
+            const prof = edgeState.profiles.get(u.id);
+            const accounts = [...edgeState.accounts.values()]
+              .filter((a) => a.userId === u.id)
+              .map((a) => ({
+                ...a,
+                balanceMinor: getEdgeWalletLedger(a.id)?.cachedBalanceMinor ?? 0,
+              }));
+            return {
+              ...sanitizeUser(u),
+              fullName: prof?.fullName || null,
+              country: prof?.country || null,
+              accounts,
+              notes: [],
+            };
+          });
         return jsonResponse({ users });
       }
 
@@ -2098,11 +2207,15 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         const staff = [...edgeState.users.values()]
           .filter((u) => ADMIN_ROLES.includes(u.role))
           .map((u) => ({
-            user: sanitizeUser(u),
-            profile: edgeState.profiles.get(u.id) ?? null,
+            ...sanitizeUser(u),
+            fullName: edgeState.profiles.get(u.id)?.fullName || null,
             pinConfigured: edgeState.pins.has(u.id),
           }));
-        return jsonResponse({ staff, rbacRules: [...edgeState.rbacRules.values()] });
+        return jsonResponse({
+          staff,
+          approvals: [...edgeState.approvals.values()],
+          rbacRules: [...edgeState.rbacRules.values()],
+        });
       }
 
       const staffAppMatch = path.match(/^\/admin\/staff\/([^/]+)\/approve$/);
@@ -2136,7 +2249,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       }
 
       if (method === 'GET' && path === '/admin/audit-logs') {
-        return jsonResponse({ logs: [...edgeState.auditLogs].reverse() });
+        return jsonResponse({ auditLogs: [...edgeState.auditLogs].reverse() });
       }
 
       if (method === 'GET' && path === '/admin/reconciliation') {

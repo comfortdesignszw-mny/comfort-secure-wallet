@@ -106,47 +106,47 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
       if (targetTab === 'overview' && permissions.has('transactions:read')) {
         setOverview(await apiFetch('/admin/overview'));
       } else if (targetTab === 'kyc' && permissions.has('kyc:read')) {
-        const res = await apiFetch<{ queue: any[] }>('/admin/kyc');
-        setKycQueue(res.queue);
+        const res = await apiFetch<{ queue?: any[] }>('/admin/kyc');
+        setKycQueue(Array.isArray(res.queue) ? res.queue : []);
       } else if (targetTab === 'deposits' && permissions.has('deposits:read')) {
-        const res = await apiFetch<{ deposits: any[] }>('/admin/deposits');
-        setDeposits(res.deposits);
+        const res = await apiFetch<{ deposits?: any[] }>('/admin/deposits');
+        setDeposits(Array.isArray(res.deposits) ? res.deposits : []);
       } else if (targetTab === 'withdrawals' && permissions.has('withdrawals:read')) {
-        const res = await apiFetch<{ withdrawals: any[] }>('/admin/withdrawals');
-        setWithdrawals(res.withdrawals);
+        const res = await apiFetch<{ withdrawals?: any[] }>('/admin/withdrawals');
+        setWithdrawals(Array.isArray(res.withdrawals) ? res.withdrawals : []);
       } else if (targetTab === 'users' && permissions.has('users:read')) {
-        const res = await apiFetch<{ users: any[] }>(`/admin/users?q=${encodeURIComponent(userQuery)}`);
-        setUsersList(res.users);
+        const res = await apiFetch<{ users?: any[] }>(`/admin/users?q=${encodeURIComponent(userQuery)}`);
+        setUsersList(Array.isArray(res.users) ? res.users : []);
       } else if (targetTab === 'transactions' && permissions.has('transactions:read')) {
-        const res = await apiFetch<{ transactions: any[] }>('/admin/transactions');
-        setTransactions(res.transactions);
+        const res = await apiFetch<{ transactions?: any[] }>('/admin/transactions');
+        setTransactions(Array.isArray(res.transactions) ? res.transactions : []);
       } else if (targetTab === 'rules') {
         if (permissions.has('fees:read') || permissions.has('fees:write')) {
-          const f = await apiFetch<{ feeRules: FeeRuleRecord[] }>('/admin/fees');
-          setFeeRules(f.feeRules);
+          const f = await apiFetch<{ feeRules?: FeeRuleRecord[] }>('/admin/fees');
+          setFeeRules(Array.isArray(f.feeRules) ? f.feeRules : []);
         }
         if (permissions.has('limits:read') || permissions.has('limits:write')) {
-          const l = await apiFetch<{ limitRules: LimitRuleRecord[] }>('/admin/limits');
-          setLimitRules(l.limitRules);
+          const l = await apiFetch<{ limitRules?: LimitRuleRecord[] }>('/admin/limits');
+          setLimitRules(Array.isArray(l.limitRules) ? l.limitRules : []);
         }
         if (permissions.has('staff:read') || permissions.has('approvals:read')) {
-          const s = await apiFetch<{ staff: any[]; approvals: ApprovalRecord[] }>('/admin/staff');
-          setApprovals(s.approvals);
+          const s = await apiFetch<{ staff?: any[]; approvals?: ApprovalRecord[] }>('/admin/staff');
+          setApprovals(Array.isArray(s.approvals) ? s.approvals : []);
         }
       } else if (targetTab === 'staff' && permissions.has('staff:read')) {
-        const s = await apiFetch<{ staff: any[]; approvals: ApprovalRecord[]; rbacRules?: RbacRuleRecord[] }>('/admin/staff');
-        setStaffList(s.staff);
-        setApprovals(s.approvals);
-        setRbacRules(s.rbacRules || []);
+        const s = await apiFetch<{ staff?: any[]; approvals?: ApprovalRecord[]; rbacRules?: RbacRuleRecord[] }>('/admin/staff');
+        setStaffList(Array.isArray(s.staff) ? s.staff : []);
+        setApprovals(Array.isArray(s.approvals) ? s.approvals : []);
+        setRbacRules(Array.isArray(s.rbacRules) ? s.rbacRules : []);
       } else if (targetTab === 'reconciliation' && permissions.has('reconciliation:read')) {
-        const r = await apiFetch<{ runs: ReconciliationRunRecord[] }>('/admin/reconciliation');
-        setReconciliationRuns(r.runs);
+        const r = await apiFetch<{ runs?: ReconciliationRunRecord[] }>('/admin/reconciliation');
+        setReconciliationRuns(Array.isArray(r.runs) ? r.runs : []);
       } else if (targetTab === 'risk' && permissions.has('risk:read')) {
-        const rf = await apiFetch<{ flags: RiskFlagRecord[] }>('/admin/risk-flags');
-        setRiskFlags(rf.flags);
+        const rf = await apiFetch<{ flags?: RiskFlagRecord[] }>('/admin/risk-flags');
+        setRiskFlags(Array.isArray(rf.flags) ? rf.flags : []);
       } else if (targetTab === 'audit' && permissions.has('audit:read')) {
-        const a = await apiFetch<{ auditLogs: AuditLogRecord[] }>('/admin/audit-logs');
-        setAuditLogs(a.auditLogs);
+        const a = await apiFetch<{ auditLogs?: AuditLogRecord[] }>('/admin/audit-logs');
+        setAuditLogs(Array.isArray(a.auditLogs) ? a.auditLogs : []);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not load admin view');
@@ -282,30 +282,30 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
               <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
                 <div className="bg-white rounded-2xl border border-slate-200 p-4">
                   <p className="text-xs text-slate-500">Wallet Users</p>
-                  <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">{overview.totalUsers}</p>
+                  <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">{overview.totalUsers ?? overview.usersCount ?? 0}</p>
                 </div>
                 <div className="bg-white rounded-2xl border border-slate-200 p-4">
                   <p className="text-xs text-slate-500">Pending KYC</p>
-                  <p className="mt-1 font-mono text-2xl font-bold text-amber-700 tabular-nums">{overview.pendingKyc}</p>
+                  <p className="mt-1 font-mono text-2xl font-bold text-amber-700 tabular-nums">{overview.pendingKyc ?? overview.pendingKycCount ?? 0}</p>
                 </div>
                 <div className="bg-white rounded-2xl border border-slate-200 p-4">
                   <p className="text-xs text-slate-500">Deposit Queue</p>
-                  <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">{overview.pendingDeposits}</p>
+                  <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">{overview.pendingDeposits ?? overview.pendingDepositsCount ?? 0}</p>
                 </div>
                 <div className="bg-white rounded-2xl border border-slate-200 p-4">
                   <p className="text-xs text-slate-500">Withdrawal Queue</p>
-                  <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">{overview.pendingWithdrawals}</p>
+                  <p className="mt-1 font-mono text-2xl font-bold text-slate-900 tabular-nums">{overview.pendingWithdrawals ?? overview.pendingWithdrawalsCount ?? 0}</p>
                 </div>
                 <div className="bg-white rounded-2xl border border-slate-200 p-4">
                   <p className="text-xs text-slate-500">Open Risk Flags</p>
-                  <p className="mt-1 font-mono text-2xl font-bold text-red-700 tabular-nums">{overview.openRiskFlags}</p>
+                  <p className="mt-1 font-mono text-2xl font-bold text-red-700 tabular-nums">{overview.openRiskFlags ?? overview.openRiskFlagsCount ?? 0}</p>
                 </div>
               </div>
 
               <div className="bg-white rounded-2xl border border-slate-200 p-6">
                 <h2 className="font-display text-base font-bold text-slate-900">
                   Double-Entry Ledger Position · Invariant{' '}
-                  {overview.ledgerInvariant.valid ? 'Balanced (Debits == Credits)' : 'IMBALANCE DETECTED'}
+                  {(overview.ledgerInvariant?.valid ?? true) ? 'Balanced (Debits == Credits)' : 'IMBALANCE DETECTED'}
                 </h2>
                 <div className="mt-4 overflow-x-auto">
                   <table className="w-full text-left text-xs border-collapse">
@@ -319,14 +319,14 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 font-mono tabular-nums">
-                      {Object.entries(overview.balancesByCurrency).map(([cur, vals]: [string, any]) => (
+                      {Object.entries(overview.balancesByCurrency || {}).map(([cur, vals]: [string, any]) => (
                         <tr key={cur}>
                           <td className="py-2.5 pr-4 font-semibold">{cur}</td>
-                          <td className="py-2.5 pr-4 text-right">{formatMinorUnits(vals.userLiabilitiesMinor, cur as Currency)}</td>
-                          <td className="py-2.5 pr-4 text-right">{formatMinorUnits(vals.withdrawalHoldMinor, cur as Currency)}</td>
-                          <td className="py-2.5 pr-4 text-right">{formatMinorUnits(vals.feeRevenueMinor, cur as Currency)}</td>
+                          <td className="py-2.5 pr-4 text-right">{formatMinorUnits(vals?.userLiabilitiesMinor ?? 0, cur as Currency)}</td>
+                          <td className="py-2.5 pr-4 text-right">{formatMinorUnits(vals?.withdrawalHoldMinor ?? 0, cur as Currency)}</td>
+                          <td className="py-2.5 pr-4 text-right">{formatMinorUnits(vals?.feeRevenueMinor ?? 0, cur as Currency)}</td>
                           <td className="py-2.5 text-right font-semibold text-emerald-700">
-                            {formatMinorUnits(vals.bankSettlementMinor, cur as Currency)}
+                            {formatMinorUnits(vals?.bankSettlementMinor ?? 0, cur as Currency)}
                           </td>
                         </tr>
                       ))}

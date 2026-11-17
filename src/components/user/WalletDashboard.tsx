@@ -227,15 +227,15 @@ export const WalletDashboard: React.FC<WalletDashboardProps> = ({
             <div>
               <span className="text-slate-500 block">Daily Withdrawal Used</span>
               <span className="font-mono font-semibold text-slate-900 tabular-nums mt-0.5 block">
-                {formatMinorUnits(activeAccount.withdrawalLimits.dailyUsedMinor, activeAccount.currency)} /{' '}
-                {formatMinorUnits(activeAccount.withdrawalLimits.dailyMaxMinor, activeAccount.currency)}
+                {formatMinorUnits(activeAccount.withdrawalLimits?.dailyUsedMinor ?? 0, activeAccount.currency)} /{' '}
+                {formatMinorUnits(activeAccount.withdrawalLimits?.dailyMaxMinor ?? 10000, activeAccount.currency)}
               </span>
             </div>
             <div>
               <span className="text-slate-500 block">Monthly Withdrawal Used</span>
               <span className="font-mono font-semibold text-slate-900 tabular-nums mt-0.5 block">
-                {formatMinorUnits(activeAccount.withdrawalLimits.monthlyUsedMinor, activeAccount.currency)} /{' '}
-                {formatMinorUnits(activeAccount.withdrawalLimits.monthlyMaxMinor, activeAccount.currency)}
+                {formatMinorUnits(activeAccount.withdrawalLimits?.monthlyUsedMinor ?? 0, activeAccount.currency)} /{' '}
+                {formatMinorUnits(activeAccount.withdrawalLimits?.monthlyMaxMinor ?? 100000, activeAccount.currency)}
               </span>
             </div>
           </div>

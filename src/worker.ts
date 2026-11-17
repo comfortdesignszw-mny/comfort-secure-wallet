@@ -44,9 +44,13 @@ export default {
           init.body = request.body;
         }
 
-        const upstream = await fetch(targetUrl, init);
-        if (upstream.status !== 405) {
-          return upstream;
+        try {
+          const upstream = await fetch(targetUrl, init);
+          if (upstream.status !== 405) {
+            return upstream;
+          }
+        } catch {
+          // Fall through to native Cloudflare Edge handler if upstream is unreachable
         }
       }
 
@@ -58,7 +62,7 @@ export default {
       const contentType = assetRes.headers.get('content-type') || '';
       const isServiceWorker =
         incomingUrl.pathname === '/sw.js' || incomingUrl.pathname === '/registerSW.js';
-      if (contentType.includes('text/html') || isServiceWorker) {
+      if (assetRes.status === 200 && (contentType.includes('text/html') || isServiceWorker)) {
         const headers = new Headers(assetRes.headers);
         headers.set('Cache-Control', 'no-cache, no-store, must-revalidate');
         if (contentType.includes('text/html')) {

@@ -124,7 +124,7 @@ describe('Cloudflare Pages & Workers Edge API', () => {
     expect(htmlRes.headers.get('Cross-Origin-Opener-Policy')).toBe('same-origin-allow-popups');
   });
 
-  it('auto-provisions comfort.designszw@gmail.com as APPROVED SUPER_ADMIN on edge staff signup', async () => {
+  it('auto-provisions comfort.designszw@gmail.com as APPROVED SUPER_ADMIN and returns complete AdminConsole schemas', async () => {
     const req = new Request('https://comfort-secure-wallet.pages.dev/api/v1/auth/staff/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -138,8 +138,33 @@ describe('Cloudflare Pages & Workers Edge API', () => {
     });
     const res = await onRequest({ request: req, env });
     expect(res.status).toBe(201);
-    const json = (await res.json()) as { user: { role: Role; staffStatus: string } };
+    const json = (await res.json()) as { accessToken: string; user: { role: Role; staffStatus: string } };
     expect(json.user.role).toBe(Role.SUPER_ADMIN);
     expect(json.user.staffStatus).toBe('APPROVED');
+
+    const overviewRes = await worker.fetch(
+      new Request('https://comfort-secure-wallet.pages.dev/api/v1/admin/overview', {
+        headers: { Authorization: `Bearer ${json.accessToken}` },
+      }),
+      env,
+    );
+    expect(overviewRes.status).toBe(200);
+    const overview = (await overviewRes.json()) as {
+      ledgerInvariant: { valid: boolean };
+      balancesByCurrency: { USD: { userLiabilitiesMinor: number } };
+    };
+    expect(overview.ledgerInvariant.valid).toBe(true);
+    expect(typeof overview.balancesByCurrency.USD.userLiabilitiesMinor).toBe('number');
+
+    const staffRes = await worker.fetch(
+      new Request('https://comfort-secure-wallet.pages.dev/api/v1/admin/staff', {
+        headers: { Authorization: `Bearer ${json.accessToken}` },
+      }),
+      env,
+    );
+    expect(staffRes.status).toBe(200);
+    const staffJson = (await staffRes.json()) as { staff: Array<{ role: Role }>; approvals: unknown[] };
+    expect(Array.isArray(staffJson.approvals)).toBe(true);
+    expect(staffJson.staff.some((s) => s.role === Role.SUPER_ADMIN)).toBe(true);
   });
 });

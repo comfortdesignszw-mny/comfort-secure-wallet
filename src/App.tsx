@@ -88,13 +88,19 @@ export default function App() {
   const loadWalletData = useCallback(async () => {
     try {
       const me = await apiFetch<{
-        user: Omit<UserRecord, 'passwordHash'>;
-        pinConfigured: boolean;
-        notificationPreferences: NotificationPreferences;
+        user?: Omit<UserRecord, 'passwordHash'>;
+        pinConfigured?: boolean;
+        notificationPreferences?: NotificationPreferences;
       }>('/me');
+      if (!me?.user) {
+        setUser(null);
+        return;
+      }
       setUser(me.user);
-      setPinConfigured(me.pinConfigured);
-      setNotifPrefs(me.notificationPreferences);
+      setPinConfigured(Boolean(me.pinConfigured));
+      if (me.notificationPreferences) {
+        setNotifPrefs(me.notificationPreferences);
+      }
       void ensurePushSubscription();
 
       if (ADMIN_ROLES.includes(me.user.role)) {
@@ -109,21 +115,27 @@ export default function App() {
         apiFetch<{ withdrawals: WithdrawalRequestRecord[] }>('/withdrawals/requests'),
         apiFetch<{ notifications: NotificationRecord[] }>('/notifications'),
       ]);
-      setAccounts(accRes.accounts);
-      if (accRes.accounts.length > 0) {
-        setSelectedAccountId((prev) => prev || accRes.accounts[0].id);
+      const nextAccounts = Array.isArray(accRes.accounts) ? accRes.accounts : [];
+      const nextTransactions = Array.isArray(txnRes.transactions) ? txnRes.transactions : [];
+      const nextDeposits = Array.isArray(depRes.deposits) ? depRes.deposits : [];
+      const nextWithdrawals = Array.isArray(wdrRes.withdrawals) ? wdrRes.withdrawals : [];
+      const nextNotifications = Array.isArray(ntfRes.notifications) ? ntfRes.notifications : [];
+
+      setAccounts(nextAccounts);
+      if (nextAccounts.length > 0) {
+        setSelectedAccountId((prev) => prev || nextAccounts[0].id);
       }
-      setTransactions(txnRes.transactions);
-      setDeposits(depRes.deposits);
-      setWithdrawals(wdrRes.withdrawals);
-      setNotifications(ntfRes.notifications);
-      void dispatchTransactionPushAlerts(ntfRes.notifications);
+      setTransactions(nextTransactions);
+      setDeposits(nextDeposits);
+      setWithdrawals(nextWithdrawals);
+      setNotifications(nextNotifications);
+      void dispatchTransactionPushAlerts(nextNotifications);
 
       const viewToken = getValidViewStepUpToken();
-      if (viewToken && accRes.accounts.length > 0) {
+      if (viewToken && nextAccounts.length > 0) {
         const nextBalances: Record<string, { balanceMinor: number; holdMinor: number }> = {};
         await Promise.all(
-          accRes.accounts.map(async (acc) => {
+          nextAccounts.map(async (acc) => {
             const b = await apiFetch<{ balanceMinor: number; holdMinor: number }>(`/accounts/${acc.id}/balance`, {
               stepUpToken: viewToken,
             });

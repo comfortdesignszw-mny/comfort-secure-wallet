@@ -41,10 +41,14 @@ export async function onRequest(context: CloudflarePagesContext): Promise<Respon
       init.body = request.body;
     }
 
-    const upstream = await fetch(targetUrl, init);
-    // If upstream mistakenly points at static hosting returning 405, handle natively in Cloudflare Edge
-    if (upstream.status !== 405) {
-      return upstream;
+    try {
+      const upstream = await fetch(targetUrl, init);
+      // If upstream mistakenly points at static hosting returning 405, handle natively in Cloudflare Edge
+      if (upstream.status !== 405) {
+        return upstream;
+      }
+    } catch {
+      // Fall through to native Cloudflare Edge handler if upstream is unreachable
     }
   }
 
