@@ -175,4 +175,85 @@ describe('Integration Flows: KYC, Maker-Checker Deposits, Concurrent Transfers, 
     // Even the newer s1 token is now revoked
     expect(() => authService.rotateRefreshToken(s1.refreshToken)).toThrow(/SESSION_REVOKED/);
   });
+
+  it('enforces deposit idempotency replay/conflict, optimistic expectedStatus locks, and staff notification visibility', async () => {
+    await kycService.decideKyc({ targetUserId: 'u_sender', officerId: 'kyc_1', decision: 'APPROVED' });
+    const senderUsd = accountsService.listUserAccounts('u_sender').find((a) => a.currency === Currency.USD)!;
+
+    dbStore.users.set('admin_maker', {
+      id: 'admin_maker',
+      email: 'maker@comfortwallet.zw',
+      phone: null,
+      passwordHash: null,
+      googleId: null,
+      role: Role.FINANCE_MAKER,
+      staffStatus: 'APPROVED',
+      requestedRole: Role.FINANCE_MAKER,
+      status: UserStatus.ACTIVE,
+      freezeReason: null,
+      kycStatus: KycStatus.APPROVED,
+      kycTier: 3,
+      emailVerified: true,
+      phoneVerified: true,
+      totpEnabled: false,
+      legalAcceptedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    });
+
+    const dep1 = await transactionsService.submitDepositRequest({
+      userId: 'u_sender',
+      accountId: senderUsd.id,
+      amountMinor: 5000,
+      currency: Currency.USD,
+      method: 'INNBUCKS',
+      paymentReference: 'INB-SYNC-9001',
+      proofDataUrl: 'data:text/plain;base64,cHJvb2Y=',
+      idempotencyKey: 'dep_idem_sync_1',
+    });
+    expect(dep1.id).toMatch(/^dep_/);
+    expect(dep1.version).toBe(1);
+
+    // Exact idempotency replay returns the identical deposit record
+    const depReplay = await transactionsService.submitDepositRequest({
+      userId: 'u_sender',
+      accountId: senderUsd.id,
+      amountMinor: 5000,
+      currency: Currency.USD,
+      method: 'INNBUCKS',
+      paymentReference: 'INB-SYNC-9001',
+      proofDataUrl: 'data:text/plain;base64,cHJvb2Y=',
+      idempotencyKey: 'dep_idem_sync_1',
+    });
+    expect(depReplay.id).toBe(dep1.id);
+    expect(dbStore.depositRequests.size).toBe(1);
+
+    // Reusing the same idempotency key with different amount must throw IDEMPOTENCY_CONFLICT
+    await expect(
+      transactionsService.submitDepositRequest({
+        userId: 'u_sender',
+        accountId: senderUsd.id,
+        amountMinor: 7500,
+        currency: Currency.USD,
+        method: 'INNBUCKS',
+        paymentReference: 'INB-SYNC-9001',
+        proofDataUrl: 'data:text/plain;base64,cHJvb2Y=',
+        idempotencyKey: 'dep_idem_sync_1',
+      }),
+    ).rejects.toThrow(/IDEMPOTENCY_CONFLICT/);
+
+    // Staff received immediate in-app/push notification for the new Add Money request
+    const staffNotifs = [...dbStore.notifications.values()].filter((n) => n.userId === 'admin_maker');
+    expect(staffNotifs.some((n) => n.template === 'ADMIN_NEW_DEPOSIT_v1')).toBe(true);
+
+    // Maker approves with expectedStatus === PENDING
+    const makerApproved = await transactionsService.makerApproveDeposit(dep1.id, 'admin_maker', undefined, DepositStatus.PENDING);
+    expect(makerApproved.status).toBe(DepositStatus.MAKER_APPROVED);
+    expect(makerApproved.version).toBe(2);
+
+    // Stale concurrent Maker click with expectedStatus === PENDING fails with STATE_CONFLICT
+    await expect(
+      transactionsService.makerApproveDeposit(dep1.id, 'admin_maker', undefined, DepositStatus.PENDING),
+    ).rejects.toThrow(/STATE_CONFLICT/);
+  });
 });
+

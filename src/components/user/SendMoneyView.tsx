@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { CheckCircle2, FileText, Search, Send } from 'lucide-react';
 import { Currency, TransactionRecord } from '../../shared/types.ts';
 import { formatMinorUnits, parseDecimalToMinorUnits } from '../../shared/money.ts';
@@ -34,10 +34,17 @@ export const SendMoneyView: React.FC<SendMoneyViewProps> = ({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [completedTxn, setCompletedTxn] = useState<TransactionRecord | null>(null);
+  const inFlightRef = useRef(false);
+  const draftIdemKeyRef = useRef(newIdempotencyKey());
 
   const selectedAcc = accounts.find((a) => a.id === fromAccountId) || accounts[0];
 
+  const resetDraftKey = () => {
+    draftIdemKeyRef.current = newIdempotencyKey();
+  };
+
   const handleLookup = async () => {
+    if (submitting) return;
     setLookupError(null);
     setRecipientPreview(null);
     setError(null);
@@ -55,6 +62,7 @@ export const SendMoneyView: React.FC<SendMoneyViewProps> = ({
         feeMinor: number;
       }>(`/accounts/lookup/${cleaned}?amountMinor=${amountMinor}`);
       setRecipientPreview(res);
+      resetDraftKey();
     } catch (err) {
       setLookupError(err instanceof Error ? err.message : 'Account lookup failed');
     }
@@ -62,6 +70,7 @@ export const SendMoneyView: React.FC<SendMoneyViewProps> = ({
 
   const handleInitiateTransfer = (e: React.FormEvent) => {
     e.preventDefault();
+    if (inFlightRef.current || submitting) return;
     setError(null);
     if (!selectedAcc || !recipientPreview) {
       setError('Verify the recipient account number first.');
@@ -77,6 +86,8 @@ export const SendMoneyView: React.FC<SendMoneyViewProps> = ({
   };
 
   const executeWithStepUp = async (stepUpToken: string) => {
+    if (inFlightRef.current || submitting) return;
+    inFlightRef.current = true;
     setPinModalOpen(false);
     setSubmitting(true);
     setError(null);
@@ -84,7 +95,7 @@ export const SendMoneyView: React.FC<SendMoneyViewProps> = ({
       const res = await apiFetch<{ transaction: TransactionRecord }>('/transfers', {
         method: 'POST',
         stepUpToken,
-        idempotencyKey: newIdempotencyKey(),
+        idempotencyKey: draftIdemKeyRef.current,
         body: JSON.stringify({
           fromAccountId: selectedAcc.id,
           toAccountNumber: recipientPreview!.accountNumber,
@@ -92,6 +103,7 @@ export const SendMoneyView: React.FC<SendMoneyViewProps> = ({
           note: note.trim() || undefined,
         }),
       });
+      draftIdemKeyRef.current = newIdempotencyKey();
       setCompletedTxn(res.transaction);
       setToAccountNumber('');
       setNote('');
@@ -100,6 +112,7 @@ export const SendMoneyView: React.FC<SendMoneyViewProps> = ({
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Transfer failed');
     } finally {
+      inFlightRef.current = false;
       setSubmitting(false);
     }
   };
@@ -228,7 +241,7 @@ export const SendMoneyView: React.FC<SendMoneyViewProps> = ({
           <button
             type="submit"
             disabled={submitting || !recipientPreview}
-            className="w-full h-12 rounded-xl bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 disabled:opacity-50 flex items-center justify-center gap-2"
+            className="w-full h-12 rounded-xl bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 active:scale-[0.98] transition-all cursor-pointer disabled:opacity-50 disabled:pointer-events-none flex items-center justify-center gap-2"
           >
             <Send className="w-4 h-4" />
             {submitting ? 'Posting Ledger Entry...' : 'Enter PIN & Send Money'}

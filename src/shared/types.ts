@@ -240,6 +240,8 @@ export interface UserRecord {
   phoneVerified: boolean;
   totpEnabled: boolean;
   legalAcceptedAt: string | null;
+  version?: number;
+  updatedAt?: string;
   createdAt: string;
 }
 
@@ -311,6 +313,8 @@ export interface AccountRecord {
   accountNumber: string;
   currency: Currency;
   status: AccountStatus;
+  version?: number;
+  updatedAt?: string;
   createdAt: string;
 }
 
@@ -368,6 +372,8 @@ export interface DepositRequestRecord {
   checkerId: string | null;
   decidedAt: string | null;
   notes: string | null;
+  version?: number;
+  updatedAt?: string;
   createdAt: string;
 }
 
@@ -385,7 +391,31 @@ export interface WithdrawalRequestRecord {
   payoutReference: string | null;
   decidedAt: string | null;
   rejectionReason: string | null;
+  version?: number;
+  updatedAt?: string;
   createdAt: string;
+}
+
+export interface IdempotencyRecord {
+  key: string;
+  scope: string;
+  userId: string;
+  payloadHash: string;
+  statusCode: number;
+  body: unknown;
+  createdAt: string;
+}
+
+export interface SyncSnapshotResponse {
+  syncedAt: string;
+  syncRevision: number;
+  cloudBackend: 'firestore' | 'kv' | 'memory';
+  ledgerBalanced: boolean;
+  counts?: {
+    pendingDeposits: number;
+    pendingWithdrawals: number;
+    pendingKyc: number;
+  };
 }
 
 export interface ApprovalRecord {

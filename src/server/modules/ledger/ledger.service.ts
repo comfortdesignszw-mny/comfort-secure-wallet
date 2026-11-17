@@ -189,8 +189,23 @@ class LedgerService {
         }
       }
 
-      dbStore.mirrorDoc('transactions', transaction.id, transaction as unknown as Record<string, unknown>);
-      dbStore.mirrorDoc('journal_entries', journalEntry.id, journalEntry as unknown as Record<string, unknown>);
+      await dbStore.persistImmediate([
+        { collection: 'transactions', id: transaction.id, data: transaction as unknown as Record<string, unknown> },
+        { collection: 'journal_entries', id: journalEntry.id, data: journalEntry as unknown as Record<string, unknown> },
+        ...lines.map((l) => ({
+          collection: 'journal_lines',
+          id: l.id,
+          data: l as unknown as Record<string, unknown>,
+        })),
+        ...params.legs.map((leg) => {
+          const la = dbStore.ledgerAccounts.get(leg.ledgerAccountId)!;
+          return {
+            collection: 'ledger_accounts',
+            id: la.id,
+            data: la as unknown as Record<string, unknown>,
+          };
+        }),
+      ]);
 
       return { transaction, journalEntry, lines };
     });
@@ -231,6 +246,9 @@ class LedgerService {
     });
 
     orig.status = TransactionStatus.REVERSED;
+    await dbStore.persistImmediate([
+      { collection: 'transactions', id: orig.id, data: orig as unknown as Record<string, unknown> },
+    ]);
     return result.transaction;
   }
 

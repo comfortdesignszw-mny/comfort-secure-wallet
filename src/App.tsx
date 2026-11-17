@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Activity,
   Clock,
@@ -6,6 +6,7 @@ import {
   KeyRound,
   LogOut,
   Plus,
+  RefreshCw,
   Send,
   Shield,
   User as UserIcon,
@@ -25,6 +26,8 @@ import {
   getValidViewStepUpToken,
   setAccessToken,
   setViewStepUpToken,
+  subscribeRealtimeSync,
+  syncCloudState,
   tryRefreshSession,
 } from './lib/api.ts';
 import { consumeGoogleRedirectResult } from './lib/firebase.ts';
@@ -79,6 +82,9 @@ export default function App() {
   });
   const [activeTab, setActiveTab] = useState<UserTab>('home');
   const [pinUnlockOpen, setPinUnlockOpen] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [justSynced, setJustSynced] = useState(false);
+  const syncLockRef = useRef(false);
 
   const openLegalDoc = (doc: LegalDocId) => {
     setLegalModalDoc(doc);
@@ -184,6 +190,32 @@ export default function App() {
       setBooting(false);
     })();
   }, [loadWalletData]);
+
+  useEffect(() => {
+    if (!user || !pinConfigured || ADMIN_ROLES.includes(user.role)) return;
+    const unsubscribe = subscribeRealtimeSync(() => {
+      void loadWalletData();
+    });
+    return () => unsubscribe();
+  }, [user?.id, user?.role, pinConfigured, loadWalletData]);
+
+  const handleManualSync = async () => {
+    if (syncLockRef.current || syncing) return;
+    syncLockRef.current = true;
+    setSyncing(true);
+    try {
+      await syncCloudState(true);
+      await loadWalletData();
+      setJustSynced(true);
+      window.setTimeout(() => setJustSynced(false), 2000);
+    } catch {
+      // Fall back to regular reload if sync fails momentarily
+      await loadWalletData();
+    } finally {
+      syncLockRef.current = false;
+      setSyncing(false);
+    }
+  };
 
   const handleMandatoryPinSet = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -506,12 +538,23 @@ export default function App() {
             </nav>
           )}
 
-          <div className="flex items-center gap-2.5 shrink-0">
+          <div className="flex items-center gap-2 shrink-0">
             <PWAInstallButton />
             <button
               type="button"
+              onClick={() => void handleManualSync()}
+              disabled={syncing}
+              title="Sync wallet & cloud transactions across devices"
+              aria-label="Sync with cloud database"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 active:scale-[0.97] transition-all cursor-pointer disabled:opacity-60 disabled:pointer-events-none min-h-[38px]"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-emerald-700 ${syncing ? 'animate-spin' : ''}`} />
+              <span>{syncing ? 'Syncing' : justSynced ? 'Synced' : 'Sync'}</span>
+            </button>
+            <button
+              type="button"
               onClick={() => setActiveTab('profile')}
-              className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 min-h-[38px]"
+              className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 active:scale-[0.97] transition-all cursor-pointer min-h-[38px]"
             >
               <Shield className="w-3.5 h-3.5 text-emerald-700" />
               Security
@@ -520,7 +563,7 @@ export default function App() {
               type="button"
               onClick={() => void handleLogout()}
               aria-label="Sign out"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 min-h-[38px]"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 active:scale-[0.97] transition-all cursor-pointer min-h-[38px]"
             >
               <LogOut className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">Sign Out</span>

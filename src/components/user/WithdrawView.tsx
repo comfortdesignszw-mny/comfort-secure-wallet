@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { ArrowUpRight } from 'lucide-react';
 import { WithdrawalRequestRecord } from '../../shared/types.ts';
 import { formatMinorUnits, parseDecimalToMinorUnits } from '../../shared/money.ts';
@@ -22,11 +22,18 @@ export const WithdrawView: React.FC<WithdrawViewProps> = ({ accounts, withdrawal
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
+  const draftIdemKeyRef = useRef(newIdempotencyKey());
 
   const selectedAcc = accounts.find((a) => a.id === accountId) || accounts[0];
 
+  const resetDraftKey = () => {
+    draftIdemKeyRef.current = newIdempotencyKey();
+  };
+
   const handleRequestSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (inFlightRef.current || submitting) return;
     setError(null);
     setSuccessMsg(null);
     if (!selectedAcc) return;
@@ -40,6 +47,8 @@ export const WithdrawView: React.FC<WithdrawViewProps> = ({ accounts, withdrawal
   };
 
   const executeWithStepUp = async (stepUpToken: string) => {
+    if (inFlightRef.current || submitting) return;
+    inFlightRef.current = true;
     setPinModalOpen(false);
     setSubmitting(true);
     setError(null);
@@ -47,7 +56,7 @@ export const WithdrawView: React.FC<WithdrawViewProps> = ({ accounts, withdrawal
       await apiFetch('/withdrawals/requests', {
         method: 'POST',
         stepUpToken,
-        idempotencyKey: newIdempotencyKey(),
+        idempotencyKey: draftIdemKeyRef.current,
         body: JSON.stringify({
           accountId: selectedAcc.id,
           amountMinor: pendingAmountMinor,
@@ -55,12 +64,14 @@ export const WithdrawView: React.FC<WithdrawViewProps> = ({ accounts, withdrawal
           destinationLabel,
         }),
       });
+      draftIdemKeyRef.current = newIdempotencyKey();
       setDestinationLabel('');
       setSuccessMsg('Withdrawal placed into hold ledger pending Maker-Checker approval and external payout.');
       await onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Withdrawal request failed');
     } finally {
+      inFlightRef.current = false;
       setSubmitting(false);
     }
   };
@@ -98,7 +109,10 @@ export const WithdrawView: React.FC<WithdrawViewProps> = ({ accounts, withdrawal
               <label className="block text-xs font-medium text-slate-700 mb-1.5">Source Wallet</label>
               <select
                 value={selectedAcc?.id || ''}
-                onChange={(e) => setAccountId(e.target.value)}
+                onChange={(e) => {
+                  setAccountId(e.target.value);
+                  resetDraftKey();
+                }}
                 className="w-full h-11 rounded-xl border border-slate-200 px-3 text-sm bg-white"
               >
                 {accounts.map((a) => (
@@ -112,7 +126,10 @@ export const WithdrawView: React.FC<WithdrawViewProps> = ({ accounts, withdrawal
               <label className="block text-xs font-medium text-slate-700 mb-1.5">Payout Channel</label>
               <select
                 value={method}
-                onChange={(e) => setMethod(e.target.value as typeof method)}
+                onChange={(e) => {
+                  setMethod(e.target.value as typeof method);
+                  resetDraftKey();
+                }}
                 className="w-full h-11 rounded-xl border border-slate-200 px-3 text-sm bg-white"
               >
                 <option value="ECOCASH">EcoCash Mobile Money</option>
@@ -132,7 +149,10 @@ export const WithdrawView: React.FC<WithdrawViewProps> = ({ accounts, withdrawal
                 inputMode="decimal"
                 required
                 value={amountInput}
-                onChange={(e) => setAmountInput(e.target.value)}
+                onChange={(e) => {
+                  setAmountInput(e.target.value);
+                  resetDraftKey();
+                }}
                 className="w-full h-11 rounded-xl border border-slate-200 px-3.5 font-mono text-sm"
               />
             </div>
@@ -143,7 +163,10 @@ export const WithdrawView: React.FC<WithdrawViewProps> = ({ accounts, withdrawal
                 required
                 minLength={4}
                 value={destinationLabel}
-                onChange={(e) => setDestinationLabel(e.target.value)}
+                onChange={(e) => {
+                  setDestinationLabel(e.target.value);
+                  resetDraftKey();
+                }}
                 placeholder="+263771234567 or CBZ-100293"
                 className="w-full h-11 rounded-xl border border-slate-200 px-3.5 font-mono text-sm"
               />
@@ -164,7 +187,7 @@ export const WithdrawView: React.FC<WithdrawViewProps> = ({ accounts, withdrawal
           <button
             type="submit"
             disabled={submitting}
-            className="w-full h-12 rounded-xl bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 disabled:opacity-60 flex items-center justify-center gap-2"
+            className="w-full h-12 rounded-xl bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 active:scale-[0.98] transition-all cursor-pointer disabled:opacity-60 disabled:pointer-events-none flex items-center justify-center gap-2"
           >
             <ArrowUpRight className="w-4 h-4" />
             {submitting ? 'Placing Hold...' : 'Authorize Withdrawal with PIN'}

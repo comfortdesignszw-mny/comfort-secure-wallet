@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
+  ADMIN_ROLES,
   AccountStatus,
   Currency,
   DepositRequestRecord,
@@ -10,13 +11,13 @@ import {
   NotificationChannel,
   RiskSeverity,
   TransactionRecord,
-  TransactionStatus,
   TransactionType,
   UserStatus,
   WithdrawalRequestRecord,
   WithdrawalStatus,
 } from '../../../shared/types.ts';
 import { formatMinorUnits } from '../../../shared/money.ts';
+import { broadcastSyncEvent } from '../../db/realtime.ts';
 import { dbStore } from '../../db/store.ts';
 import { encryptBuffer, encryptField, signStorageKey } from '../../security/crypto.ts';
 import { recordAuditLog } from '../../security/audit.ts';
@@ -63,10 +64,15 @@ class TransactionsService {
     const normalizedRef = params.paymentReference.trim().toUpperCase();
 
     return dbStore.runInTransaction([`deposit_ref:${normalizedRef}`, `account:${account.id}`], async () => {
-      // Idempotency check
-      const existingIdem = dbStore.idempotencyResponses.get(`dep:${params.userId}:${params.idempotencyKey}`);
-      if (existingIdem) {
-        return existingIdem.body as DepositRequestRecord;
+      const idem = dbStore.checkIdempotency('dep', params.userId, params.idempotencyKey, {
+        accountId: params.accountId,
+        amountMinor: params.amountMinor,
+        currency: params.currency,
+        method: params.method,
+        paymentReference: normalizedRef,
+      });
+      if (idem.hit) {
+        return idem.record.body as DepositRequestRecord;
       }
 
       // Duplicate payment-reference detection across non-rejected deposits
@@ -88,13 +94,14 @@ class TransactionsService {
       const match = params.proofDataUrl.match(/^data:([^;]+);base64,(.+)$/);
       const mimeType = match ? match[1] : 'image/png';
       const rawBuf = match ? Buffer.from(match[2], 'base64') : Buffer.from(params.proofDataUrl, 'utf8');
+      const now = new Date().toISOString();
       const storageKey = `private/deposit-proofs/${params.userId}/${randomUUID()}`;
       dbStore.privateBlobs.set(storageKey, {
         storageKey,
         mimeType,
         encryptedPayload: encryptBuffer(rawBuf),
         ownerUserId: params.userId,
-        createdAt: new Date().toISOString(),
+        createdAt: now,
       });
 
       const reqRecord: DepositRequestRecord = {
@@ -111,13 +118,19 @@ class TransactionsService {
         checkerId: null,
         decidedAt: null,
         notes: null,
-        createdAt: new Date().toISOString(),
+        version: 1,
+        updatedAt: now,
+        createdAt: now,
       };
       dbStore.depositRequests.set(reqRecord.id, reqRecord);
-      dbStore.idempotencyResponses.set(`dep:${params.userId}:${params.idempotencyKey}`, {
+      const idemRec = dbStore.recordIdempotencyResponse({
+        cacheKey: idem.cacheKey,
+        scope: 'dep',
+        userId: params.userId,
+        key: params.idempotencyKey,
+        payloadHash: idem.payloadHash,
         statusCode: 201,
         body: reqRecord,
-        userId: params.userId,
       });
 
       await notificationService.enqueue({
@@ -127,6 +140,18 @@ class TransactionsService {
         body: `Deposit request of ${formatMinorUnits(params.amountMinor, params.currency)} (${normalizedRef}) submitted for verification.`,
       });
 
+      // Notify active finance/super-admin operators immediately in Back-Office
+      for (const staff of dbStore.users.values()) {
+        if (ADMIN_ROLES.includes(staff.role) && staff.staffStatus === 'APPROVED') {
+          await notificationService.enqueue({
+            userId: staff.id,
+            channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH],
+            template: 'ADMIN_NEW_DEPOSIT_v1',
+            body: `New deposit request ${normalizedRef} (${formatMinorUnits(params.amountMinor, params.currency)}) awaiting Maker review.`,
+          });
+        }
+      }
+
       recordAuditLog({
         actorId: params.userId,
         actorType: 'USER',
@@ -135,14 +160,31 @@ class TransactionsService {
         after: { amountMinor: params.amountMinor, currency: params.currency, reference: normalizedRef },
       });
 
+      const rev = await dbStore.persistImmediate([
+        { collection: 'deposit_requests', id: reqRecord.id, data: reqRecord as unknown as Record<string, unknown> },
+        { collection: 'idempotency_keys', id: idem.cacheKey, data: idemRec as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'DEPOSIT_CREATED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: reqRecord.id,
+        targetUserIds: [params.userId],
+        notifyAdmins: true,
+      });
+
       return reqRecord;
     });
   }
 
-  async makerApproveDeposit(depositId: string, makerId: string, notes?: string) {
+  async makerApproveDeposit(depositId: string, makerId: string, notes?: string, expectedStatus?: DepositStatus) {
     return dbStore.runInTransaction([`deposit:${depositId}`], async () => {
       const dep = dbStore.depositRequests.get(depositId);
       if (!dep) throw new Error('Deposit request not found');
+      if (expectedStatus && dep.status !== expectedStatus) {
+        throw new Error(`STATE_CONFLICT: Deposit status already changed to ${dep.status} on another session.`);
+      }
       if (dep.status !== DepositStatus.PENDING) {
         throw new Error(`INVALID_STATE: Deposit is currently ${dep.status}.`);
       }
@@ -153,8 +195,9 @@ class TransactionsService {
       const before = { status: dep.status, makerId: dep.makerId };
       dep.makerId = makerId;
       dep.notes = notes || null;
+      dep.version = (dep.version ?? 1) + 1;
+      dep.updatedAt = new Date().toISOString();
 
-      // If strictly below configurable dual-approval threshold, single maker finalizes; otherwise waits for Checker
       if (dep.amountMinor < dbStore.makerCheckerThresholdMinor) {
         await this.finalizeDepositPosting(dep, makerId);
       } else {
@@ -170,14 +213,30 @@ class TransactionsService {
         after: { status: dep.status, makerId: dep.makerId },
       });
 
+      const rev = await dbStore.persistImmediate([
+        { collection: 'deposit_requests', id: dep.id, data: dep as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'DEPOSIT_UPDATED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: dep.id,
+        targetUserIds: [dep.userId],
+        notifyAdmins: true,
+      });
+
       return dep;
     });
   }
 
-  async checkerApproveDeposit(depositId: string, checkerId: string, notes?: string) {
+  async checkerApproveDeposit(depositId: string, checkerId: string, notes?: string, expectedStatus?: DepositStatus) {
     return dbStore.runInTransaction([`deposit:${depositId}`], async () => {
       const dep = dbStore.depositRequests.get(depositId);
       if (!dep) throw new Error('Deposit request not found');
+      if (expectedStatus && dep.status !== expectedStatus) {
+        throw new Error(`STATE_CONFLICT: Deposit status already changed to ${dep.status} on another session.`);
+      }
       if (dep.status !== DepositStatus.MAKER_APPROVED) {
         throw new Error(`INVALID_STATE: Deposit must be MAKER_APPROVED before checker approval (current: ${dep.status}).`);
       }
@@ -187,6 +246,8 @@ class TransactionsService {
 
       const before = { status: dep.status, checkerId: dep.checkerId };
       if (notes) dep.notes = notes;
+      dep.version = (dep.version ?? 1) + 1;
+      dep.updatedAt = new Date().toISOString();
       await this.finalizeDepositPosting(dep, checkerId);
 
       recordAuditLog({
@@ -196,6 +257,19 @@ class TransactionsService {
         entity: `deposit:${dep.id}`,
         before,
         after: { status: dep.status, checkerId: dep.checkerId },
+      });
+
+      const rev = await dbStore.persistImmediate([
+        { collection: 'deposit_requests', id: dep.id, data: dep as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'DEPOSIT_UPDATED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: dep.id,
+        targetUserIds: [dep.userId],
+        notifyAdmins: true,
       });
 
       return dep;
@@ -237,6 +311,7 @@ class TransactionsService {
     dep.checkerId = dep.makerId === approverId ? null : approverId;
     dep.status = DepositStatus.APPROVED;
     dep.decidedAt = new Date().toISOString();
+    dep.updatedAt = dep.decidedAt;
 
     await notificationService.enqueue({
       userId: dep.userId,
@@ -246,20 +321,26 @@ class TransactionsService {
     });
   }
 
-  async rejectDeposit(depositId: string, staffId: string, reason: string) {
+  async rejectDeposit(depositId: string, staffId: string, reason: string, expectedStatus?: DepositStatus) {
     if (!reason || reason.trim().length < 3) {
       throw new Error('REJECTION_REASON_REQUIRED: Rejection requires a clear reason.');
     }
     return dbStore.runInTransaction([`deposit:${depositId}`], async () => {
       const dep = dbStore.depositRequests.get(depositId);
       if (!dep) throw new Error('Deposit request not found');
+      if (expectedStatus && dep.status !== expectedStatus) {
+        throw new Error(`STATE_CONFLICT: Deposit status already changed to ${dep.status} on another session.`);
+      }
       if (dep.status === DepositStatus.APPROVED || dep.status === DepositStatus.REJECTED) {
         throw new Error(`INVALID_STATE: Deposit is already ${dep.status}.`);
       }
       const before = { status: dep.status };
+      const now = new Date().toISOString();
       dep.status = DepositStatus.REJECTED;
       dep.notes = reason.trim();
-      dep.decidedAt = new Date().toISOString();
+      dep.decidedAt = now;
+      dep.updatedAt = now;
+      dep.version = (dep.version ?? 1) + 1;
       if (!dep.makerId) dep.makerId = staffId;
       else if (dep.makerId !== staffId) dep.checkerId = staffId;
 
@@ -278,6 +359,20 @@ class TransactionsService {
         before,
         after: { status: dep.status, reason: dep.notes },
       });
+
+      const rev = await dbStore.persistImmediate([
+        { collection: 'deposit_requests', id: dep.id, data: dep as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'DEPOSIT_UPDATED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: dep.id,
+        targetUserIds: [dep.userId],
+        notifyAdmins: true,
+      });
+
       return dep;
     });
   }
@@ -322,17 +417,19 @@ class TransactionsService {
     const feeLedger = dbStore.getSystemLedgerAccount(LedgerAccountType.FEE_REVENUE, currency);
     if (!fromLedger || !toLedger) throw new Error('Ledger account configuration missing');
 
-    // Lock both wallet accounts in consistent sorted order (ledger locks acquired strictly inside postAtomicTransaction)
     const lockKeys = [`account:${fromAccount.id}`, `account:${toAccount.id}`];
 
     return dbStore.runInTransaction(lockKeys, async () => {
-      const idemCacheKey = `trf:${params.userId}:${params.idempotencyKey}`;
-      const existingIdem = dbStore.idempotencyResponses.get(idemCacheKey);
-      if (existingIdem) {
-        return existingIdem.body as TransactionRecord;
+      const idem = dbStore.checkIdempotency('trf', params.userId, params.idempotencyKey, {
+        fromAccountId: params.fromAccountId,
+        toAccountNumber: params.toAccountNumber,
+        amountMinor: params.amountMinor,
+        note: params.note || '',
+      });
+      if (idem.hit) {
+        return idem.record.body as TransactionRecord;
       }
 
-      // Limit enforcement
       rulesService.assertWithinLimits({
         userId: sender.id,
         kycTier: sender.kycTier,
@@ -342,7 +439,6 @@ class TransactionsService {
         amountMinor: params.amountMinor,
       });
 
-      // Risk evaluation
       riskService.evaluateTransactionRisk(sender.id, TransactionType.TRANSFER, params.amountMinor);
 
       const legs = [
@@ -390,10 +486,14 @@ class TransactionsService {
         },
       });
 
-      dbStore.idempotencyResponses.set(idemCacheKey, {
+      const idemRec = dbStore.recordIdempotencyResponse({
+        cacheKey: idem.cacheKey,
+        scope: 'trf',
+        userId: params.userId,
+        key: params.idempotencyKey,
+        payloadHash: idem.payloadHash,
         statusCode: 201,
         body: posted.transaction,
-        userId: params.userId,
       });
 
       await notificationService.enqueue({
@@ -424,6 +524,19 @@ class TransactionsService {
         },
       });
 
+      const rev = await dbStore.persistImmediate([
+        { collection: 'idempotency_keys', id: idem.cacheKey, data: idemRec as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'TRANSFER_COMPLETED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: posted.transaction.id,
+        targetUserIds: [sender.id, recipientUser.id],
+        notifyAdmins: true,
+      });
+
       return posted.transaction;
     });
   }
@@ -447,13 +560,16 @@ class TransactionsService {
     if (!userLedger) throw new Error('User ledger account missing');
 
     return dbStore.runInTransaction([`account:${account.id}`], async () => {
-      const idemKey = `wdr_req:${params.userId}:${params.idempotencyKey}`;
-      const existing = dbStore.idempotencyResponses.get(idemKey);
-      if (existing) {
-        return existing.body as WithdrawalRequestRecord;
+      const idem = dbStore.checkIdempotency('wdr_req', params.userId, params.idempotencyKey, {
+        accountId: params.accountId,
+        amountMinor: params.amountMinor,
+        method: params.method,
+        destinationLabel: params.destinationLabel,
+      });
+      if (idem.hit) {
+        return idem.record.body as WithdrawalRequestRecord;
       }
 
-      // Enforce daily & monthly withdrawal limits
       rulesService.assertWithinLimits({
         userId: user.id,
         kycTier: user.kycTier,
@@ -468,7 +584,6 @@ class TransactionsService {
       const reqId = `wdr_${randomUUID()}`;
       const ref = `WDR-${randomUUID().slice(0, 8).toUpperCase()}`;
 
-      // Move funds to hold ledger account
       await ledgerService.postAtomicTransaction({
         type: TransactionType.WITHDRAWAL,
         amountMinor: params.amountMinor,
@@ -496,6 +611,7 @@ class TransactionsService {
         metadata: { withdrawalRequestId: reqId, stage: 'HOLD_PLACED', method: params.method },
       });
 
+      const now = new Date().toISOString();
       const maskedDest = `${params.method}: ••••${params.destinationLabel.slice(-4)}`;
       const wdr: WithdrawalRequestRecord = {
         id: reqId,
@@ -511,10 +627,20 @@ class TransactionsService {
         payoutReference: null,
         decidedAt: null,
         rejectionReason: null,
-        createdAt: new Date().toISOString(),
+        version: 1,
+        updatedAt: now,
+        createdAt: now,
       };
       dbStore.withdrawalRequests.set(wdr.id, wdr);
-      dbStore.idempotencyResponses.set(idemKey, { statusCode: 201, body: wdr, userId: user.id });
+      const idemRec = dbStore.recordIdempotencyResponse({
+        cacheKey: idem.cacheKey,
+        scope: 'wdr_req',
+        userId: user.id,
+        key: params.idempotencyKey,
+        payloadHash: idem.payloadHash,
+        statusCode: 201,
+        body: wdr,
+      });
 
       await notificationService.enqueue({
         userId: user.id,
@@ -531,14 +657,31 @@ class TransactionsService {
         after: { amountMinor: params.amountMinor, currency, destinationPreview: maskedDest },
       });
 
+      const rev = await dbStore.persistImmediate([
+        { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+        { collection: 'idempotency_keys', id: idem.cacheKey, data: idemRec as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'WITHDRAWAL_CREATED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: wdr.id,
+        targetUserIds: [user.id],
+        notifyAdmins: true,
+      });
+
       return wdr;
     });
   }
 
-  async makerApproveWithdrawal(withdrawalId: string, makerId: string) {
+  async makerApproveWithdrawal(withdrawalId: string, makerId: string, expectedStatus?: WithdrawalStatus) {
     return dbStore.runInTransaction([`withdrawal:${withdrawalId}`], async () => {
       const wdr = dbStore.withdrawalRequests.get(withdrawalId);
       if (!wdr) throw new Error('Withdrawal request not found');
+      if (expectedStatus && wdr.status !== expectedStatus) {
+        throw new Error(`STATE_CONFLICT: Withdrawal status already changed to ${wdr.status} on another session.`);
+      }
       if (wdr.status !== WithdrawalStatus.PENDING) {
         throw new Error(`INVALID_STATE: Withdrawal is ${wdr.status}`);
       }
@@ -551,6 +694,8 @@ class TransactionsService {
         wdr.amountMinor < dbStore.makerCheckerThresholdMinor
           ? WithdrawalStatus.CHECKER_APPROVED
           : WithdrawalStatus.MAKER_APPROVED;
+      wdr.version = (wdr.version ?? 1) + 1;
+      wdr.updatedAt = new Date().toISOString();
 
       recordAuditLog({
         actorId: makerId,
@@ -560,14 +705,31 @@ class TransactionsService {
         before,
         after: { status: wdr.status, makerId },
       });
+
+      const rev = await dbStore.persistImmediate([
+        { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'WITHDRAWAL_UPDATED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: wdr.id,
+        targetUserIds: [wdr.userId],
+        notifyAdmins: true,
+      });
+
       return wdr;
     });
   }
 
-  async checkerApproveWithdrawal(withdrawalId: string, checkerId: string) {
+  async checkerApproveWithdrawal(withdrawalId: string, checkerId: string, expectedStatus?: WithdrawalStatus) {
     return dbStore.runInTransaction([`withdrawal:${withdrawalId}`], async () => {
       const wdr = dbStore.withdrawalRequests.get(withdrawalId);
       if (!wdr) throw new Error('Withdrawal request not found');
+      if (expectedStatus && wdr.status !== expectedStatus) {
+        throw new Error(`STATE_CONFLICT: Withdrawal status already changed to ${wdr.status} on another session.`);
+      }
       if (wdr.status !== WithdrawalStatus.MAKER_APPROVED) {
         throw new Error(`INVALID_STATE: Withdrawal must be MAKER_APPROVED first (current: ${wdr.status})`);
       }
@@ -577,6 +739,8 @@ class TransactionsService {
       const before = { status: wdr.status };
       wdr.checkerId = checkerId;
       wdr.status = WithdrawalStatus.CHECKER_APPROVED;
+      wdr.version = (wdr.version ?? 1) + 1;
+      wdr.updatedAt = new Date().toISOString();
 
       recordAuditLog({
         actorId: checkerId,
@@ -586,17 +750,34 @@ class TransactionsService {
         before,
         after: { status: wdr.status, checkerId },
       });
+
+      const rev = await dbStore.persistImmediate([
+        { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'WITHDRAWAL_UPDATED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: wdr.id,
+        targetUserIds: [wdr.userId],
+        notifyAdmins: true,
+      });
+
       return wdr;
     });
   }
 
-  async markWithdrawalPaid(withdrawalId: string, staffId: string, payoutReference: string) {
+  async markWithdrawalPaid(withdrawalId: string, staffId: string, payoutReference: string, expectedStatus?: WithdrawalStatus) {
     if (!payoutReference || payoutReference.trim().length < 4) {
       throw new Error('PAYOUT_REFERENCE_REQUIRED: External bank/mobile-money payout reference is required.');
     }
     return dbStore.runInTransaction([`withdrawal:${withdrawalId}`], async () => {
       const wdr = dbStore.withdrawalRequests.get(withdrawalId);
       if (!wdr) throw new Error('Withdrawal request not found');
+      if (expectedStatus && wdr.status !== expectedStatus) {
+        throw new Error(`STATE_CONFLICT: Withdrawal status already changed to ${wdr.status} on another session.`);
+      }
       if (wdr.status !== WithdrawalStatus.CHECKER_APPROVED) {
         throw new Error(`INVALID_STATE: Withdrawal must be CHECKER_APPROVED before payout (current: ${wdr.status})`);
       }
@@ -631,9 +812,12 @@ class TransactionsService {
       });
 
       const before = { status: wdr.status };
+      const now = new Date().toISOString();
       wdr.status = WithdrawalStatus.PAID;
       wdr.payoutReference = payoutReference.trim().toUpperCase();
-      wdr.decidedAt = new Date().toISOString();
+      wdr.decidedAt = now;
+      wdr.updatedAt = now;
+      wdr.version = (wdr.version ?? 1) + 1;
 
       await notificationService.enqueue({
         userId: wdr.userId,
@@ -651,17 +835,33 @@ class TransactionsService {
         after: { status: wdr.status, payoutReference: wdr.payoutReference },
       });
 
+      const rev = await dbStore.persistImmediate([
+        { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'WITHDRAWAL_UPDATED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: wdr.id,
+        targetUserIds: [wdr.userId],
+        notifyAdmins: true,
+      });
+
       return wdr;
     });
   }
 
-  async rejectWithdrawal(withdrawalId: string, staffId: string, reason: string) {
+  async rejectWithdrawal(withdrawalId: string, staffId: string, reason: string, expectedStatus?: WithdrawalStatus) {
     if (!reason || reason.trim().length < 3) {
       throw new Error('REJECTION_REASON_REQUIRED');
     }
     return dbStore.runInTransaction([`withdrawal:${withdrawalId}`], async () => {
       const wdr = dbStore.withdrawalRequests.get(withdrawalId);
       if (!wdr) throw new Error('Withdrawal request not found');
+      if (expectedStatus && wdr.status !== expectedStatus) {
+        throw new Error(`STATE_CONFLICT: Withdrawal status already changed to ${wdr.status} on another session.`);
+      }
       if (wdr.status === WithdrawalStatus.PAID || wdr.status === WithdrawalStatus.REJECTED) {
         throw new Error(`INVALID_STATE: Withdrawal is already ${wdr.status}`);
       }
@@ -670,7 +870,6 @@ class TransactionsService {
       const holdLedger = dbStore.getSystemLedgerAccount(LedgerAccountType.WITHDRAWAL_HOLD, wdr.currency);
       if (!userLedger) throw new Error('User ledger account missing');
 
-      // Release hold back to user wallet
       await ledgerService.postAtomicTransaction({
         type: TransactionType.REVERSAL,
         amountMinor: wdr.amountMinor,
@@ -699,9 +898,12 @@ class TransactionsService {
       });
 
       const before = { status: wdr.status };
+      const now = new Date().toISOString();
       wdr.status = WithdrawalStatus.REJECTED;
       wdr.rejectionReason = reason.trim();
-      wdr.decidedAt = new Date().toISOString();
+      wdr.decidedAt = now;
+      wdr.updatedAt = now;
+      wdr.version = (wdr.version ?? 1) + 1;
 
       await notificationService.enqueue({
         userId: wdr.userId,
@@ -717,6 +919,19 @@ class TransactionsService {
         entity: `withdrawal:${wdr.id}`,
         before,
         after: { status: wdr.status, reason: wdr.rejectionReason },
+      });
+
+      const rev = await dbStore.persistImmediate([
+        { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+      ]);
+
+      broadcastSyncEvent({
+        type: 'WITHDRAWAL_UPDATED',
+        syncRevision: rev,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: wdr.id,
+        targetUserIds: [wdr.userId],
+        notifyAdmins: true,
       });
 
       return wdr;

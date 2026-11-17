@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { Clock, FileCheck2, ShieldAlert, Upload } from 'lucide-react';
 import { KycStatus } from '../../shared/types.ts';
 import { apiFetch } from '../../lib/api.ts';
@@ -24,6 +24,7 @@ export const KycOnboarding: React.FC<KycOnboardingProps> = ({ kycStatus, onSubmi
   const [selfieDataUrl, setSelfieDataUrl] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
 
   const readFileAsDataUrl = (file: File, setter: (v: string) => void) => {
     const reader = new FileReader();
@@ -33,6 +34,8 @@ export const KycOnboarding: React.FC<KycOnboardingProps> = ({ kycStatus, onSubmi
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (inFlightRef.current || submitting) return;
+    inFlightRef.current = true;
     setSubmitting(true);
     setError(null);
     try {
@@ -53,6 +56,7 @@ export const KycOnboarding: React.FC<KycOnboardingProps> = ({ kycStatus, onSubmi
     } catch (err) {
       setError(err instanceof Error ? err.message : 'KYC submission failed');
     } finally {
+      inFlightRef.current = false;
       setSubmitting(false);
     }
   };
@@ -70,7 +74,7 @@ export const KycOnboarding: React.FC<KycOnboardingProps> = ({ kycStatus, onSubmi
         <button
           type="button"
           onClick={() => void onSubmitted()}
-          className="mt-6 px-5 py-2.5 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 min-h-[44px]"
+          className="mt-6 px-5 py-2.5 rounded-xl border border-slate-200 text-xs font-semibold text-slate-700 hover:bg-slate-50 active:scale-[0.98] transition-all cursor-pointer min-h-[44px]"
         >
           Refresh Verification Status
         </button>
@@ -211,7 +215,7 @@ export const KycOnboarding: React.FC<KycOnboardingProps> = ({ kycStatus, onSubmi
         <button
           type="submit"
           disabled={submitting}
-          className="w-full h-12 rounded-xl bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 transition-colors disabled:opacity-60"
+          className="w-full h-12 rounded-xl bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 active:scale-[0.98] transition-all cursor-pointer disabled:opacity-60 disabled:pointer-events-none"
         >
           {submitting ? 'Encrypting & Uploading...' : 'Submit KYC for Officer Review'}
         </button>

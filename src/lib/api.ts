@@ -1,3 +1,5 @@
+import type { SyncSnapshotResponse } from '../shared/types.ts';
+
 export class ApiError extends Error {
   code: string;
   status: number;
@@ -192,3 +194,111 @@ export async function tryRefreshSession(): Promise<{ accessToken: string; user: 
     return null;
   }
 }
+
+export async function syncCloudState(force = true): Promise<SyncSnapshotResponse> {
+  return apiFetch<SyncSnapshotResponse>('/sync', {
+    method: 'POST',
+    body: JSON.stringify({ force }),
+  });
+}
+
+export interface RealtimeSyncEvent {
+  type: string;
+  syncRevision: number;
+  syncedAt: string;
+  entityId?: string;
+}
+
+export function subscribeRealtimeSync(onEvent: (evt: RealtimeSyncEvent) => void): () => void {
+  if (typeof window === 'undefined') return () => {};
+  let disposed = false;
+  let lastRevision = 0;
+  let pollTimer: number | null = null;
+  let streamController: AbortController | null = null;
+
+  const emitIfNewer = (evt: RealtimeSyncEvent) => {
+    if (disposed) return;
+    if (evt.syncRevision > lastRevision) {
+      lastRevision = evt.syncRevision;
+      onEvent(evt);
+    }
+  };
+
+  const startPolling = () => {
+    if (disposed || pollTimer !== null) return;
+    pollTimer = window.setInterval(async () => {
+      if (disposed || !inMemoryAccessToken || document.visibilityState === 'hidden') return;
+      try {
+        const snap = await apiFetch<SyncSnapshotResponse>('/sync?force=true');
+        emitIfNewer({
+          type: 'POLL_SYNC',
+          syncRevision: snap.syncRevision,
+          syncedAt: snap.syncedAt,
+        });
+      } catch {
+        // Silent retry on next tick
+      }
+    }, 4000);
+  };
+
+  const connectStream = async () => {
+    if (disposed || !inMemoryAccessToken) {
+      startPolling();
+      return;
+    }
+    streamController = new AbortController();
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/events/stream`, {
+        headers: { Authorization: `Bearer ${inMemoryAccessToken}` },
+        credentials: 'include',
+        signal: streamController.signal,
+      });
+      if (!res.ok || !res.body) {
+        startPolling();
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (!disposed) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const frames = buffer.split('\n\n');
+        buffer = frames.pop() || '';
+        for (const frame of frames) {
+          let eventType = 'message';
+          let dataStr = '';
+          for (const line of frame.split('\n')) {
+            if (line.startsWith('event:')) eventType = line.slice(6).trim();
+            else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+          }
+          if (eventType === 'sync' && dataStr) {
+            try {
+              const parsed = JSON.parse(dataStr) as RealtimeSyncEvent;
+              if (parsed.type === 'CONNECTED') {
+                lastRevision = Math.max(lastRevision, parsed.syncRevision || 0);
+              } else {
+                emitIfNewer(parsed);
+              }
+            } catch {
+              // ignore malformed SSE frame
+            }
+          }
+        }
+      }
+      if (!disposed) startPolling();
+    } catch {
+      if (!disposed) startPolling();
+    }
+  };
+
+  void connectStream();
+
+  return () => {
+    disposed = true;
+    if (streamController) streamController.abort();
+    if (pollTimer !== null) window.clearInterval(pollTimer);
+  };
+}
+

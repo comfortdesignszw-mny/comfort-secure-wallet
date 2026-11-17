@@ -16,5 +16,11 @@ run_worker_first = true
 #   - WALLET_PIN_PEPPER
 #   - WALLET_FIELD_ENCRYPTION_KEY
 #   - WALLET_SIGNED_URL_SECRET
+#   - FIREBASE_SERVICE_ACCOUNT_JSON (service account JSON for Cloud Firestore real-time persistence across isolates/devices)
 #   - SUPER_ADMIN_EMAIL (defaults to comfort.designszw@gmail.com)
 #   - API_ORIGIN (optional: only set if pointing to an external Node API; leave unset to run natively on Cloudflare Workers)
+# Optional Cloudflare KV fallback binding:
+# [[kv_namespaces]]
+# binding = "WALLET_KV"
+# id = "<your-kv-namespace-id>"
+

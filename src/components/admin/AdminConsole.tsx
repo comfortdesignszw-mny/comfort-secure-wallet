@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -9,6 +9,7 @@ import {
   History,
   LayoutDashboard,
   LogOut,
+  RefreshCw,
   Scale,
   Settings,
   Users,
@@ -32,7 +33,7 @@ import {
   WithdrawalRequestRecord,
 } from '../../shared/types.ts';
 import { formatMinorUnits } from '../../shared/money.ts';
-import { apiFetch } from '../../lib/api.ts';
+import { apiFetch, newIdempotencyKey, subscribeRealtimeSync, syncCloudState } from '../../lib/api.ts';
 import { LegalDocId } from '../LegalDocsModal.tsx';
 import { PinSheet } from '../PinSheet.tsx';
 import { SiteFooter } from '../SiteFooter.tsx';
@@ -97,30 +98,43 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
   const [extBankInput, setExtBankInput] = useState('');
   const [flatFeeInput, setFlatFeeInput] = useState('15');
   const [bpsFeeInput, setBpsFeeInput] = useState('50');
+  const [syncing, setSyncing] = useState(false);
+  const [justSynced, setJustSynced] = useState(false);
+  const [busyActionKey, setBusyActionKey] = useState<string | null>(null);
+  const inFlightActionRef = useRef(false);
+  const syncLockRef = useRef(false);
 
   const permissions = new Set(ROLE_PERMISSIONS[currentUser.role] || []);
 
-  const loadTab = async (targetTab: AdminTab) => {
+  const loadTab = useCallback(async (targetTab: AdminTab) => {
     setError(null);
     try {
-      if (targetTab === 'overview' && permissions.has('transactions:read')) {
-        setOverview(await apiFetch('/admin/overview'));
+      const overviewPromise = permissions.has('transactions:read')
+        ? apiFetch('/admin/overview').then((ov) => setOverview(ov))
+        : Promise.resolve();
+
+      if (targetTab === 'overview') {
+        await overviewPromise;
       } else if (targetTab === 'kyc' && permissions.has('kyc:read')) {
-        const res = await apiFetch<{ queue?: any[] }>('/admin/kyc');
+        const [, res] = await Promise.all([overviewPromise, apiFetch<{ queue?: any[] }>('/admin/kyc')]);
         setKycQueue(Array.isArray(res.queue) ? res.queue : []);
       } else if (targetTab === 'deposits' && permissions.has('deposits:read')) {
-        const res = await apiFetch<{ deposits?: any[] }>('/admin/deposits');
+        const [, res] = await Promise.all([overviewPromise, apiFetch<{ deposits?: any[] }>('/admin/deposits')]);
         setDeposits(Array.isArray(res.deposits) ? res.deposits : []);
       } else if (targetTab === 'withdrawals' && permissions.has('withdrawals:read')) {
-        const res = await apiFetch<{ withdrawals?: any[] }>('/admin/withdrawals');
+        const [, res] = await Promise.all([overviewPromise, apiFetch<{ withdrawals?: any[] }>('/admin/withdrawals')]);
         setWithdrawals(Array.isArray(res.withdrawals) ? res.withdrawals : []);
       } else if (targetTab === 'users' && permissions.has('users:read')) {
-        const res = await apiFetch<{ users?: any[] }>(`/admin/users?q=${encodeURIComponent(userQuery)}`);
+        const [, res] = await Promise.all([
+          overviewPromise,
+          apiFetch<{ users?: any[] }>(`/admin/users?q=${encodeURIComponent(userQuery)}`),
+        ]);
         setUsersList(Array.isArray(res.users) ? res.users : []);
       } else if (targetTab === 'transactions' && permissions.has('transactions:read')) {
-        const res = await apiFetch<{ transactions?: any[] }>('/admin/transactions');
+        const [, res] = await Promise.all([overviewPromise, apiFetch<{ transactions?: any[] }>('/admin/transactions')]);
         setTransactions(Array.isArray(res.transactions) ? res.transactions : []);
       } else if (targetTab === 'rules') {
+        await overviewPromise;
         if (permissions.has('fees:read') || permissions.has('fees:write')) {
           const f = await apiFetch<{ feeRules?: FeeRuleRecord[] }>('/admin/fees');
           setFeeRules(Array.isArray(f.feeRules) ? f.feeRules : []);
@@ -134,30 +148,63 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
           setApprovals(Array.isArray(s.approvals) ? s.approvals : []);
         }
       } else if (targetTab === 'staff' && permissions.has('staff:read')) {
-        const s = await apiFetch<{ staff?: any[]; approvals?: ApprovalRecord[]; rbacRules?: RbacRuleRecord[] }>('/admin/staff');
+        const [, s] = await Promise.all([
+          overviewPromise,
+          apiFetch<{ staff?: any[]; approvals?: ApprovalRecord[]; rbacRules?: RbacRuleRecord[] }>('/admin/staff'),
+        ]);
         setStaffList(Array.isArray(s.staff) ? s.staff : []);
         setApprovals(Array.isArray(s.approvals) ? s.approvals : []);
         setRbacRules(Array.isArray(s.rbacRules) ? s.rbacRules : []);
       } else if (targetTab === 'reconciliation' && permissions.has('reconciliation:read')) {
-        const r = await apiFetch<{ runs?: ReconciliationRunRecord[] }>('/admin/reconciliation');
+        const [, r] = await Promise.all([overviewPromise, apiFetch<{ runs?: ReconciliationRunRecord[] }>('/admin/reconciliation')]);
         setReconciliationRuns(Array.isArray(r.runs) ? r.runs : []);
       } else if (targetTab === 'risk' && permissions.has('risk:read')) {
-        const rf = await apiFetch<{ flags?: RiskFlagRecord[] }>('/admin/risk-flags');
+        const [, rf] = await Promise.all([overviewPromise, apiFetch<{ flags?: RiskFlagRecord[] }>('/admin/risk-flags')]);
         setRiskFlags(Array.isArray(rf.flags) ? rf.flags : []);
       } else if (targetTab === 'audit' && permissions.has('audit:read')) {
-        const a = await apiFetch<{ auditLogs?: AuditLogRecord[] }>('/admin/audit-logs');
+        const [, a] = await Promise.all([overviewPromise, apiFetch<{ auditLogs?: AuditLogRecord[] }>('/admin/audit-logs')]);
         setAuditLogs(Array.isArray(a.auditLogs) ? a.auditLogs : []);
+      } else {
+        await overviewPromise;
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not load admin view');
     }
-  };
+  }, [currentUser.role, userQuery]);
 
   useEffect(() => {
     void loadTab(tab);
-  }, [tab]);
+  }, [tab, loadTab]);
 
-  const runAction = async (fn: () => Promise<void>, successMessage: string) => {
+  useEffect(() => {
+    const unsubscribe = subscribeRealtimeSync(() => {
+      void loadTab(tab);
+    });
+    return () => unsubscribe();
+  }, [tab, loadTab]);
+
+  const handleManualSync = async () => {
+    if (syncLockRef.current || syncing) return;
+    syncLockRef.current = true;
+    setSyncing(true);
+    setError(null);
+    try {
+      await syncCloudState(true);
+      await loadTab(tab);
+      setJustSynced(true);
+      window.setTimeout(() => setJustSynced(false), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Cloud sync failed');
+    } finally {
+      syncLockRef.current = false;
+      setSyncing(false);
+    }
+  };
+
+  const runAction = async (fn: () => Promise<void>, successMessage: string, actionKey = 'action') => {
+    if (inFlightActionRef.current) return;
+    inFlightActionRef.current = true;
+    setBusyActionKey(actionKey);
     setError(null);
     setNotice(null);
     try {
@@ -166,6 +213,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
       await loadTab(tab);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Action failed');
+    } finally {
+      inFlightActionRef.current = false;
+      setBusyActionKey(null);
     }
   };
 
@@ -175,22 +225,23 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
     fn: (stepUpToken: string) => Promise<void>,
     successMessage: string,
   ) => {
+    if (inFlightActionRef.current || busyActionKey) return;
     setError(null);
     setNotice(null);
     setPendingPinAction({ adminAction, title, fn, successMessage });
   };
 
-  const navItems: Array<{ id: AdminTab; label: string; icon: React.ReactNode; show: boolean }> = [
+  const navItems: Array<{ id: AdminTab; label: string; icon: React.ReactNode; show: boolean; badge?: number }> = [
     { id: 'overview', label: 'Overview', icon: <LayoutDashboard className="w-4 h-4" />, show: permissions.has('transactions:read') },
-    { id: 'kyc', label: 'KYC Queue', icon: <FileCheck className="w-4 h-4" />, show: permissions.has('kyc:read') },
-    { id: 'deposits', label: 'Deposits', icon: <ArrowDownCircle className="w-4 h-4" />, show: permissions.has('deposits:read') },
-    { id: 'withdrawals', label: 'Withdrawals', icon: <ArrowUpCircle className="w-4 h-4" />, show: permissions.has('withdrawals:read') },
+    { id: 'kyc', label: 'KYC Queue', icon: <FileCheck className="w-4 h-4" />, show: permissions.has('kyc:read'), badge: overview?.pendingKyc ?? 0 },
+    { id: 'deposits', label: 'Deposits', icon: <ArrowDownCircle className="w-4 h-4" />, show: permissions.has('deposits:read'), badge: overview?.pendingDeposits ?? 0 },
+    { id: 'withdrawals', label: 'Withdrawals', icon: <ArrowUpCircle className="w-4 h-4" />, show: permissions.has('withdrawals:read'), badge: overview?.pendingWithdrawals ?? 0 },
     { id: 'users', label: 'Users & Accounts', icon: <Users className="w-4 h-4" />, show: permissions.has('users:read') },
     { id: 'transactions', label: 'Ledger & Txns', icon: <Activity className="w-4 h-4" />, show: permissions.has('transactions:read') },
     { id: 'rules', label: 'Fees & Limits', icon: <Settings className="w-4 h-4" />, show: permissions.has('fees:read') || permissions.has('fees:write') },
     { id: 'staff', label: 'Staff & Dual Control', icon: <CheckCircle2 className="w-4 h-4" />, show: permissions.has('staff:read') },
     { id: 'reconciliation', label: 'Reconciliation', icon: <Scale className="w-4 h-4" />, show: permissions.has('reconciliation:read') },
-    { id: 'risk', label: 'Risk Flags', icon: <AlertTriangle className="w-4 h-4" />, show: permissions.has('risk:read') },
+    { id: 'risk', label: 'Risk Flags', icon: <AlertTriangle className="w-4 h-4" />, show: permissions.has('risk:read'), badge: overview?.openRiskFlags ?? 0 },
     { id: 'audit', label: 'Audit Log', icon: <History className="w-4 h-4" />, show: permissions.has('audit:read') },
   ];
 
@@ -215,14 +266,21 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                   key={item.id}
                   type="button"
                   onClick={() => setTab(item.id)}
-                  className={`flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-xs font-medium whitespace-nowrap transition-colors min-h-[40px] ${
+                  className={`flex items-center justify-between gap-2.5 px-3 py-2.5 rounded-xl text-xs font-medium whitespace-nowrap transition-all active:scale-[0.98] cursor-pointer min-h-[40px] ${
                     tab === item.id
                       ? 'bg-emerald-50 text-emerald-800 font-semibold'
                       : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
                   }`}
                 >
-                  {item.icon}
-                  <span>{item.label}</span>
+                  <span className="flex items-center gap-2.5">
+                    {item.icon}
+                    <span>{item.label}</span>
+                  </span>
+                  {typeof item.badge === 'number' && item.badge > 0 && (
+                    <span className="px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 font-mono text-[10px] font-bold">
+                      {item.badge}
+                    </span>
+                  )}
                 </button>
               ))}
           </nav>
@@ -232,14 +290,14 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
           <button
             type="button"
             onClick={onSwitchToWallet}
-            className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 text-left"
+            className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs font-medium text-slate-700 hover:bg-slate-50 active:scale-[0.98] transition-all cursor-pointer text-left"
           >
             Switch to User PWA
           </button>
           <button
             type="button"
             onClick={() => void onLogout()}
-            className="w-full px-3 py-2 rounded-xl text-xs font-medium text-red-700 hover:bg-red-50 flex items-center gap-2"
+            className="w-full px-3 py-2 rounded-xl text-xs font-medium text-red-700 hover:bg-red-50 active:scale-[0.98] transition-all cursor-pointer flex items-center gap-2"
           >
             <LogOut className="w-3.5 h-3.5" />
             Sign Out
@@ -249,16 +307,27 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
 
       {/* Main Content */}
       <div className="flex-1 min-w-0 flex flex-col">
-        <header className="bg-white border-b border-slate-200 px-6 py-3.5 flex items-center justify-between gap-4">
+        <header className="bg-white border-b border-slate-200 px-4 sm:px-6 py-3.5 flex items-center justify-between gap-4">
           <div className="text-xs text-slate-500">
             Back-Office / <span className="font-semibold text-slate-900 capitalize">{tab}</span>
           </div>
-          <div className="flex items-center gap-3 text-xs text-slate-600">
-            <span className="hidden sm:inline font-mono">{currentUser.email}</span>
+          <div className="flex items-center gap-2.5 text-xs text-slate-600">
+            <button
+              type="button"
+              onClick={() => void handleManualSync()}
+              disabled={syncing}
+              title="Sync pending deposits, withdrawals & ledger state from cloud"
+              aria-label="Sync Back-Office with cloud"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 active:scale-[0.97] transition-all cursor-pointer disabled:opacity-60 disabled:pointer-events-none"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-emerald-700 ${syncing ? 'animate-spin' : ''}`} />
+              <span>{syncing ? 'Syncing' : justSynced ? 'Synced' : 'Sync'}</span>
+            </button>
+            <span className="hidden sm:inline font-mono">{currentUser.email || currentUser.phone}</span>
             <button
               type="button"
               onClick={() => void onLogout()}
-              className="lg:hidden px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-medium"
+              className="lg:hidden px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-medium active:scale-[0.97] transition-all cursor-pointer"
             >
               Sign Out
             </button>
@@ -446,7 +515,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                           {d.status === 'PENDING' && permissions.has('deposits:make') && (
                             <button
                               type="button"
-                              onClick={() =>
+                              disabled={Boolean(busyActionKey)}
+                              onClick={() => {
+                                const idem = newIdempotencyKey();
                                 runPinGuardedAction(
                                   'deposit_approve',
                                   'Authorize Deposit Maker Approval',
@@ -454,12 +525,13 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                                     apiFetch(`/admin/deposits/${d.id}/approve`, {
                                       method: 'POST',
                                       stepUpToken,
-                                      body: JSON.stringify({}),
+                                      idempotencyKey: idem,
+                                      body: JSON.stringify({ expectedStatus: d.status }),
                                     }),
                                   'Deposit Maker-approved. Ready for Finance Checker.',
-                                )
-                              }
-                              className="px-3 py-1.5 rounded-lg bg-slate-900 text-white font-semibold"
+                                );
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800 active:scale-[0.97] transition-all cursor-pointer disabled:opacity-50 disabled:pointer-events-none"
                             >
                               Maker Approve
                             </button>
@@ -467,7 +539,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                           {d.status === 'MAKER_APPROVED' && permissions.has('deposits:check') && (
                             <button
                               type="button"
-                              onClick={() =>
+                              disabled={Boolean(busyActionKey)}
+                              onClick={() => {
+                                const idem = newIdempotencyKey();
                                 runPinGuardedAction(
                                   'deposit_approve',
                                   'Authorize Deposit Checker Ledger Post',
@@ -475,12 +549,13 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                                     apiFetch(`/admin/deposits/${d.id}/approve`, {
                                       method: 'POST',
                                       stepUpToken,
-                                      body: JSON.stringify({}),
+                                      idempotencyKey: idem,
+                                      body: JSON.stringify({ expectedStatus: d.status }),
                                     }),
                                   'Deposit Checker-approved and posted to ledger.',
-                                )
-                              }
-                              className="px-3 py-1.5 rounded-lg bg-emerald-700 text-white font-semibold"
+                                );
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-emerald-700 text-white font-semibold hover:bg-emerald-800 active:scale-[0.97] transition-all cursor-pointer disabled:opacity-50 disabled:pointer-events-none"
                             >
                               Checker Post
                             </button>
@@ -488,7 +563,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                           {(d.status === 'PENDING' || d.status === 'MAKER_APPROVED') && permissions.has('deposits:make') && (
                             <button
                               type="button"
-                              onClick={() =>
+                              disabled={Boolean(busyActionKey)}
+                              onClick={() => {
+                                const idem = newIdempotencyKey();
                                 runPinGuardedAction(
                                   'deposit_reject',
                                   'Authorize Deposit Rejection',
@@ -496,12 +573,13 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                                     apiFetch(`/admin/deposits/${d.id}/reject`, {
                                       method: 'POST',
                                       stepUpToken,
-                                      body: JSON.stringify({ reason: 'Unmatched settlement reference' }),
+                                      idempotencyKey: idem,
+                                      body: JSON.stringify({ reason: 'Unmatched settlement reference', expectedStatus: d.status }),
                                     }),
                                   'Deposit rejected.',
-                                )
-                              }
-                              className="px-3 py-1.5 rounded-lg border border-red-200 text-red-700 font-semibold"
+                                );
+                              }}
+                              className="px-3 py-1.5 rounded-lg border border-red-200 text-red-700 font-semibold hover:bg-red-50 active:scale-[0.97] transition-all cursor-pointer disabled:opacity-50 disabled:pointer-events-none"
                             >
                               Reject
                             </button>
@@ -542,7 +620,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                           {w.status === 'PENDING' && permissions.has('withdrawals:make') && (
                             <button
                               type="button"
-                              onClick={() =>
+                              disabled={Boolean(busyActionKey)}
+                              onClick={() => {
+                                const idem = newIdempotencyKey();
                                 runPinGuardedAction(
                                   'withdrawal_approve',
                                   'Authorize Withdrawal Maker Approval',
@@ -550,12 +630,13 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                                     apiFetch(`/admin/withdrawals/${w.id}/approve`, {
                                       method: 'POST',
                                       stepUpToken,
-                                      body: JSON.stringify({}),
+                                      idempotencyKey: idem,
+                                      body: JSON.stringify({ expectedStatus: w.status }),
                                     }),
                                   'Withdrawal Maker-approved.',
-                                )
-                              }
-                              className="px-3 py-1.5 rounded-lg bg-slate-900 text-white font-semibold"
+                                );
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800 active:scale-[0.97] transition-all cursor-pointer disabled:opacity-50 disabled:pointer-events-none"
                             >
                               Maker Approve
                             </button>
@@ -563,7 +644,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                           {w.status === 'MAKER_APPROVED' && permissions.has('withdrawals:check') && (
                             <button
                               type="button"
-                              onClick={() =>
+                              disabled={Boolean(busyActionKey)}
+                              onClick={() => {
+                                const idem = newIdempotencyKey();
                                 runPinGuardedAction(
                                   'withdrawal_approve',
                                   'Authorize Withdrawal Checker Approval',
@@ -571,12 +654,13 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                                     apiFetch(`/admin/withdrawals/${w.id}/approve`, {
                                       method: 'POST',
                                       stepUpToken,
-                                      body: JSON.stringify({}),
+                                      idempotencyKey: idem,
+                                      body: JSON.stringify({ expectedStatus: w.status }),
                                     }),
                                   'Withdrawal Checker-approved. Ready for external payout.',
-                                )
-                              }
-                              className="px-3 py-1.5 rounded-lg bg-emerald-700 text-white font-semibold"
+                                );
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-emerald-700 text-white font-semibold hover:bg-emerald-800 active:scale-[0.97] transition-all cursor-pointer disabled:opacity-50 disabled:pointer-events-none"
                             >
                               Checker Approve
                             </button>
@@ -592,7 +676,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                               />
                               <button
                                 type="button"
-                                onClick={() =>
+                                disabled={Boolean(busyActionKey)}
+                                onClick={() => {
+                                  const idem = newIdempotencyKey();
                                   runPinGuardedAction(
                                     'withdrawal_payout',
                                     'Authorize External Payout Settlement',
@@ -600,12 +686,16 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                                       apiFetch(`/admin/withdrawals/${w.id}/mark-paid`, {
                                         method: 'POST',
                                         stepUpToken,
-                                        body: JSON.stringify({ payoutReference: payoutRefMap[w.id] || `PAY-${w.id.slice(-6).toUpperCase()}` }),
+                                        idempotencyKey: idem,
+                                        body: JSON.stringify({
+                                          payoutReference: payoutRefMap[w.id] || `PAY-${w.id.slice(-6).toUpperCase()}`,
+                                          expectedStatus: w.status,
+                                        }),
                                       }),
                                     'Payout marked paid and hold released to settlement.',
-                                  )
-                                }
-                                className="px-3 py-1.5 rounded-lg bg-emerald-700 text-white font-semibold"
+                                  );
+                                }}
+                                className="px-3 py-1.5 rounded-lg bg-emerald-700 text-white font-semibold hover:bg-emerald-800 active:scale-[0.97] transition-all cursor-pointer disabled:opacity-50 disabled:pointer-events-none"
                               >
                                 Mark Paid
                               </button>
@@ -615,7 +705,9 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                             permissions.has('withdrawals:make') && (
                               <button
                                 type="button"
-                                onClick={() =>
+                                disabled={Boolean(busyActionKey)}
+                                onClick={() => {
+                                  const idem = newIdempotencyKey();
                                   runPinGuardedAction(
                                     'withdrawal_reject',
                                     'Authorize Withdrawal Rejection & Release',
@@ -623,12 +715,16 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                                       apiFetch(`/admin/withdrawals/${w.id}/reject`, {
                                         method: 'POST',
                                         stepUpToken,
-                                        body: JSON.stringify({ reason: 'Payout destination validation failed' }),
+                                        idempotencyKey: idem,
+                                        body: JSON.stringify({
+                                          reason: 'Payout destination validation failed',
+                                          expectedStatus: w.status,
+                                        }),
                                       }),
                                     'Withdrawal rejected and held funds returned to user wallet.',
-                                  )
-                                }
-                                className="px-3 py-1.5 rounded-lg border border-red-200 text-red-700 font-semibold"
+                                  );
+                                }}
+                                className="px-3 py-1.5 rounded-lg border border-red-200 text-red-700 font-semibold hover:bg-red-50 active:scale-[0.97] transition-all cursor-pointer disabled:opacity-50 disabled:pointer-events-none"
                               >
                                 Reject & Release
                               </button>
@@ -1256,7 +1352,7 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
           const current = pendingPinAction;
           setPendingPinAction(null);
           if (current) {
-            void runAction(() => current.fn(stepUpToken), current.successMessage);
+            void runAction(() => current.fn(stepUpToken), current.successMessage, current.adminAction);
           }
         }}
       />

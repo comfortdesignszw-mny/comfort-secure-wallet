@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { initializeApp, getApps } from 'firebase-admin/app';
 import { getFirestore, Firestore } from 'firebase-admin/firestore';
 import firebaseConfig from '../../../firebase-applet-config.json' with { type: 'json' };
@@ -7,7 +8,9 @@ import {
   AuditLogRecord,
   Currency,
   DepositRequestRecord,
+  DepositStatus,
   FeeRuleRecord,
+  IdempotencyRecord,
   JournalEntryRecord,
   JournalLineRecord,
   KycDocumentRecord,
@@ -29,7 +32,28 @@ import {
   UserProfileRecord,
   UserRecord,
   WithdrawalRequestRecord,
+  WithdrawalStatus,
 } from '../../shared/types.ts';
+
+export function computeCanonicalPayloadHash(payload: unknown): string {
+  const stableStringify = (val: unknown): string => {
+    if (val === null || typeof val !== 'object') return JSON.stringify(val);
+    if (Array.isArray(val)) return `[${val.map(stableStringify).join(',')}]`;
+    const entries = Object.entries(val as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`;
+  };
+  return createHash('sha256').update(stableStringify(payload)).digest('hex');
+}
+
+function stripUndefined<T extends Record<string, unknown>>(obj: T): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
+}
 
 /**
  * Per-key asynchronous mutex implementing consistent ordered row-level locking
@@ -78,10 +102,23 @@ export interface EncryptedBlobRecord {
   createdAt: string;
 }
 
+export interface CloudWriteItem {
+  collection: string;
+  id: string;
+  data: Record<string, unknown>;
+}
+
+const TERMINAL_DEPOSIT = new Set<string>([DepositStatus.APPROVED, DepositStatus.REJECTED]);
+const TERMINAL_WITHDRAWAL = new Set<string>([WithdrawalStatus.PAID, WithdrawalStatus.REJECTED]);
+
 class WalletDatabaseStore {
   private lockManager = new OrderedLockManager();
   private firestoreDb: Firestore | null = null;
   private firestoreMirrorEnabled = false;
+  private lastCloudPullMs = 0;
+
+  syncRevision = 1;
+  lastSyncedAt = new Date().toISOString();
 
   users = new Map<string, UserRecord>();
   userProfiles = new Map<string, UserProfileRecord>();
@@ -92,7 +129,7 @@ class WalletDatabaseStore {
   accounts = new Map<string, AccountRecord>();
   ledgerAccounts = new Map<string, LedgerAccountRecord>();
   transactions = new Map<string, TransactionRecord>();
-  idempotencyResponses = new Map<string, { statusCode: number; body: unknown; userId: string }>();
+  idempotencyResponses = new Map<string, IdempotencyRecord>();
   usedStepUpTokens = new Set<string>();
   journalEntries: JournalEntryRecord[] = [];
   journalLines: JournalLineRecord[] = [];
@@ -186,6 +223,8 @@ class WalletDatabaseStore {
     this.statementJobs.clear();
     this.privateBlobs.clear();
     this.makerCheckerThresholdMinor = 0;
+    this.syncRevision = 1;
+    this.lastSyncedAt = new Date().toISOString();
     this.initSystemLedgerAccounts();
   }
 
@@ -205,6 +244,58 @@ class WalletDatabaseStore {
       }
     }
     return undefined;
+  }
+
+  getCloudBackend(): 'firestore' | 'memory' {
+    return this.firestoreMirrorEnabled && this.firestoreDb ? 'firestore' : 'memory';
+  }
+
+  bumpSyncRevision(): number {
+    this.syncRevision += 1;
+    this.lastSyncedAt = new Date().toISOString();
+    return this.syncRevision;
+  }
+
+  checkIdempotency(
+    scope: string,
+    userId: string,
+    key: string,
+    payload: unknown,
+  ): { hit: true; record: IdempotencyRecord } | { hit: false; cacheKey: string; payloadHash: string } {
+    const cacheKey = `${scope}:${userId}:${key}`;
+    const payloadHash = computeCanonicalPayloadHash(payload);
+    const existing = this.idempotencyResponses.get(cacheKey);
+    if (existing) {
+      if (existing.payloadHash && existing.payloadHash !== payloadHash) {
+        throw new Error(
+          'IDEMPOTENCY_CONFLICT: Idempotency-Key was already used with different transaction parameters.',
+        );
+      }
+      return { hit: true, record: existing };
+    }
+    return { hit: false, cacheKey, payloadHash };
+  }
+
+  recordIdempotencyResponse(params: {
+    cacheKey: string;
+    scope: string;
+    userId: string;
+    key: string;
+    payloadHash: string;
+    statusCode: number;
+    body: unknown;
+  }): IdempotencyRecord {
+    const record: IdempotencyRecord = {
+      key: params.key,
+      scope: params.scope,
+      userId: params.userId,
+      payloadHash: params.payloadHash,
+      statusCode: params.statusCode,
+      body: params.body,
+      createdAt: new Date().toISOString(),
+    };
+    this.idempotencyResponses.set(params.cacheKey, record);
+    return record;
   }
 
   /**
@@ -240,15 +331,232 @@ class WalletDatabaseStore {
 
   mirrorDoc(collectionName: string, docId: string, data: Record<string, unknown>) {
     if (!this.firestoreMirrorEnabled || !this.firestoreDb) return;
-    // Best-effort non-blocking mirror to Firestore when Admin credentials are active in Cloud Run
     this.firestoreDb
       .collection(collectionName)
       .doc(docId)
-      .set(data, { merge: true })
+      .set(stripUndefined(data), { merge: true })
       .catch(() => {
         // Suppress background mirror noise if sandbox lacks ADC IAM
       });
   }
+
+  /**
+   * Immediately persists critical mutations in a single Firestore batch + updates sync_state.
+   */
+  async persistImmediate(writes: CloudWriteItem[]): Promise<number> {
+    const rev = this.bumpSyncRevision();
+    if (!this.firestoreMirrorEnabled || !this.firestoreDb) {
+      return rev;
+    }
+
+    try {
+      const chunkSize = 400;
+      const allWrites: CloudWriteItem[] = [
+        ...writes,
+        {
+          collection: 'system_meta',
+          id: 'sync_state',
+          data: { syncRevision: rev, updatedAt: this.lastSyncedAt },
+        },
+      ];
+      for (let i = 0; i < allWrites.length; i += chunkSize) {
+        const batch = this.firestoreDb.batch();
+        for (const item of allWrites.slice(i, i + chunkSize)) {
+          const ref = this.firestoreDb.collection(item.collection).doc(item.id);
+          batch.set(ref, stripUndefined(item.data), { merge: true });
+        }
+        await batch.commit();
+      }
+    } catch {
+      // Preserve in-memory durability if sandbox runtime lacks Firestore Admin credentials
+    }
+    return rev;
+  }
+
+  /**
+   * Pulls and reconciles latest cloud state from Firestore with conflict-safe merge rules.
+   */
+  async syncFromCloud(force = false): Promise<{ syncRevision: number; syncedAt: string; cloudBackend: 'firestore' | 'memory' }> {
+    const nowMs = Date.now();
+    if (!this.firestoreMirrorEnabled || !this.firestoreDb) {
+      this.lastSyncedAt = new Date().toISOString();
+      return {
+        syncRevision: this.syncRevision,
+        syncedAt: this.lastSyncedAt,
+        cloudBackend: 'memory',
+      };
+    }
+
+    if (!force && nowMs - this.lastCloudPullMs < 1500) {
+      return {
+        syncRevision: this.syncRevision,
+        syncedAt: this.lastSyncedAt,
+        cloudBackend: 'firestore',
+      };
+    }
+
+    try {
+      const metaDoc = await this.firestoreDb.collection('system_meta').doc('sync_state').get();
+      const cloudRev = Number((metaDoc.data()?.syncRevision as number | undefined) || 0);
+      if (!force && cloudRev > 0 && cloudRev <= this.syncRevision && this.lastCloudPullMs > 0) {
+        this.lastCloudPullMs = nowMs;
+        this.lastSyncedAt = new Date().toISOString();
+        return { syncRevision: this.syncRevision, syncedAt: this.lastSyncedAt, cloudBackend: 'firestore' };
+      }
+
+      const fetchCol = async (name: string) => {
+        const snap = await this.firestoreDb!.collection(name).limit(500).get();
+        return snap.docs.map((d) => ({ id: d.id, data: d.data() }));
+      };
+
+      const [
+        usersDocs,
+        accountsDocs,
+        ledgerDocs,
+        txnDocs,
+        jeDocs,
+        jlDocs,
+        depDocs,
+        wdrDocs,
+        notifDocs,
+        auditDocs,
+      ] = await Promise.all([
+        fetchCol('users'),
+        fetchCol('accounts'),
+        fetchCol('ledger_accounts'),
+        fetchCol('transactions'),
+        fetchCol('journal_entries'),
+        fetchCol('journal_lines'),
+        fetchCol('deposit_requests'),
+        fetchCol('withdrawal_requests'),
+        fetchCol('notifications'),
+        fetchCol('audit_logs'),
+      ]);
+
+      for (const { id, data } of usersDocs) {
+        const incoming = data as unknown as UserRecord;
+        const local = this.users.get(id);
+        if (!local || (incoming.version ?? 0) > (local.version ?? 0)) {
+          this.users.set(id, { ...local, ...incoming });
+        }
+      }
+
+      for (const { id, data } of accountsDocs) {
+        const incoming = data as unknown as AccountRecord;
+        const local = this.accounts.get(id);
+        if (!local || (incoming.version ?? 0) > (local.version ?? 0)) {
+          this.accounts.set(id, incoming);
+        }
+      }
+
+      for (const { id, data } of ledgerDocs) {
+        if (!this.ledgerAccounts.has(id)) {
+          this.ledgerAccounts.set(id, data as unknown as LedgerAccountRecord);
+        }
+      }
+
+      const knownEntries = new Set(this.journalEntries.map((e) => e.id));
+      for (const { id, data } of jeDocs) {
+        if (!knownEntries.has(id)) {
+          this.journalEntries.push(data as unknown as JournalEntryRecord);
+          knownEntries.add(id);
+        }
+      }
+
+      const knownLines = new Set(this.journalLines.map((l) => l.id));
+      for (const { id, data } of jlDocs) {
+        if (!knownLines.has(id)) {
+          this.journalLines.push(data as unknown as JournalLineRecord);
+          knownLines.add(id);
+        }
+      }
+
+      for (const { id, data } of txnDocs) {
+        const incoming = data as unknown as TransactionRecord;
+        const local = this.transactions.get(id);
+        if (!local || (incoming.status === 'REVERSED' && local.status !== 'REVERSED')) {
+          this.transactions.set(id, incoming);
+        }
+      }
+
+      for (const { id, data } of depDocs) {
+        const incoming = data as unknown as DepositRequestRecord;
+        const local = this.depositRequests.get(id);
+        const shouldReplace =
+          !local ||
+          (incoming.version ?? 0) > (local.version ?? 0) ||
+          (TERMINAL_DEPOSIT.has(incoming.status) && !TERMINAL_DEPOSIT.has(local.status));
+        if (shouldReplace) {
+          this.depositRequests.set(id, incoming);
+        }
+      }
+
+      for (const { id, data } of wdrDocs) {
+        const incoming = data as unknown as WithdrawalRequestRecord;
+        const local = this.withdrawalRequests.get(id);
+        const shouldReplace =
+          !local ||
+          (incoming.version ?? 0) > (local.version ?? 0) ||
+          (TERMINAL_WITHDRAWAL.has(incoming.status) && !TERMINAL_WITHDRAWAL.has(local.status));
+        if (shouldReplace) {
+          this.withdrawalRequests.set(id, incoming);
+        }
+      }
+
+      for (const { id, data } of notifDocs) {
+        const incoming = data as unknown as NotificationRecord;
+        if (!this.notifications.has(id)) {
+          this.notifications.set(id, incoming);
+        }
+      }
+
+      const knownAudits = new Set(this.auditLogs.map((a) => a.id));
+      for (const { id, data } of auditDocs) {
+        if (!knownAudits.has(id)) {
+          this.auditLogs.push(data as unknown as AuditLogRecord);
+          knownAudits.add(id);
+        }
+      }
+
+      // Recompute cached balances from derived journal lines when journal lines exist
+      for (const la of this.ledgerAccounts.values()) {
+        const isAsset =
+          la.type === LedgerAccountType.BANK_SETTLEMENT ||
+          la.type === LedgerAccountType.SUSPENSE;
+        let bal = 0;
+        let hasLine = false;
+        for (const line of this.journalLines) {
+          if (line.ledgerAccountId !== la.id) continue;
+          hasLine = true;
+          bal += isAsset
+            ? line.direction === 'debit'
+              ? line.amountMinor
+              : -line.amountMinor
+            : line.direction === 'credit'
+              ? line.amountMinor
+              : -line.amountMinor;
+        }
+        if (hasLine) {
+          la.cachedBalanceMinor = bal;
+        }
+      }
+
+      if (cloudRev > this.syncRevision) {
+        this.syncRevision = cloudRev;
+      }
+      this.lastCloudPullMs = nowMs;
+      this.lastSyncedAt = new Date().toISOString();
+    } catch {
+      this.lastSyncedAt = new Date().toISOString();
+    }
+
+    return {
+      syncRevision: this.syncRevision,
+      syncedAt: this.lastSyncedAt,
+      cloudBackend: 'firestore',
+    };
+  }
 }
 
 export const dbStore = new WalletDatabaseStore();
+

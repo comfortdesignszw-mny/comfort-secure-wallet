@@ -37,7 +37,7 @@ service cloud.firestore {
 
     function isValidUserAccount(data, userId) {
       return data.keys().hasAll(['id', 'role', 'staffStatus', 'status', 'kycStatus', 'kycTier', 'createdAt'])
-        && data.keys().hasOnly(['id', 'email', 'phone', 'role', 'staffStatus', 'requestedRole', 'status', 'kycStatus', 'kycTier', 'legalAcceptedAt', 'createdAt'])
+        && data.keys().hasOnly(['id', 'email', 'phone', 'role', 'staffStatus', 'requestedRole', 'status', 'kycStatus', 'kycTier', 'version', 'legalAcceptedAt', 'createdAt', 'updatedAt'])
         && data.id is string && data.id == userId && data.id.size() <= 128
         && data.role == 'USER'
         && data.staffStatus in ['NONE', 'PENDING_APPROVAL']
@@ -89,7 +89,7 @@ service cloud.firestore {
       }
     }
 
-    // All ledger, wallet accounts, transactions, journal entries, notifications, and audit logs are strictly server-authoritative
+    // Customer-owned server-authoritative collections (read-only for owner or admin; zero client writes)
     match /accounts/{accountId} {
       allow get: if isSignedIn() && isValidId(accountId) && (resource.data.userId == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
@@ -102,14 +102,106 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    match /deposit_requests/{depositId} {
+      allow get: if isSignedIn() && isValidId(depositId) && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
+    match /withdrawal_requests/{withdrawalId} {
+      allow get: if isSignedIn() && isValidId(withdrawalId) && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
     match /notifications/{notificationId} {
       allow get: if isSignedIn() && isValidId(notificationId) && (resource.data.userId == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
       allow write: if false;
     }
 
+    match /notification_preferences/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if false;
+      allow write: if false;
+    }
+
+    // Strict server-only sensitive PII, cryptographic secrets, idempotency locks, and sessions
+    match /user_profiles/{userId} {
+      allow read, write: if false;
+    }
+
+    match /kyc_documents/{docId} {
+      allow read, write: if false;
+    }
+
+    match /pins/{userId} {
+      allow read, write: if false;
+    }
+
+    match /sessions/{sessionId} {
+      allow read, write: if false;
+    }
+
+    match /idempotency_keys/{idemId} {
+      allow read, write: if false;
+    }
+
+    match /system_meta/{metaId} {
+      allow read, write: if false;
+    }
+
+    // Admin-readable, strictly server-written ledger, governance, and audit collections
+    match /ledger_accounts/{ledgerAccountId} {
+      allow get: if isAdmin() && isValidId(ledgerAccountId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
     match /journal_entries/{entryId} {
       allow get: if isAdmin() && isValidId(entryId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /journal_lines/{lineId} {
+      allow get: if isAdmin() && isValidId(lineId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /fee_rules/{ruleId} {
+      allow get: if isAdmin() && isValidId(ruleId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /limit_rules/{ruleId} {
+      allow get: if isAdmin() && isValidId(ruleId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /approvals/{approvalId} {
+      allow get: if isAdmin() && isValidId(approvalId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /risk_flags/{flagId} {
+      allow get: if isAdmin() && isValidId(flagId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /reconciliation_runs/{runId} {
+      allow get: if isAdmin() && isValidId(runId);
+      allow list: if isAdmin();
+      allow write: if false;
+    }
+
+    match /support_notes/{noteId} {
+      allow get: if isAdmin() && isValidId(noteId);
       allow list: if isAdmin();
       allow write: if false;
     }

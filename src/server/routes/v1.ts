@@ -24,6 +24,7 @@ import {
   withdrawalRequestSchema,
 } from '../../shared/validation.ts';
 import { getSuperAdminEmail } from '../config/env.ts';
+import { broadcastSyncEvent, subscribeSseClient } from '../db/realtime.ts';
 import { dbStore } from '../db/store.ts';
 import {
   decryptBuffer,
@@ -95,7 +96,7 @@ function handleError(req: AuthenticatedRequest, res: import('express').Response,
         ? 403
         : code.includes('NOT_FOUND')
           ? 404
-          : code.includes('DUPLICATE')
+          : code.includes('DUPLICATE') || code.includes('CONFLICT')
             ? 409
             : code.includes('RATE_LIMITED') || code.includes('THROTTLED')
               ? 429
@@ -139,7 +140,114 @@ export function createV1Router(): Router {
 
   router.get('/health', (_req, res) => {
     const invariant = ledgerService.verifyGlobalInvariant();
-    res.json({ status: 'ok', ledgerBalanced: invariant.valid });
+    res.json({
+      status: 'ok',
+      ledgerBalanced: invariant.valid,
+      syncRevision: dbStore.syncRevision,
+      cloudBackend: dbStore.getCloudBackend(),
+    });
+  });
+
+  // Real-time Server-Sent Events stream for live balance & Back-Office queue updates
+  router.get('/events/stream', (req: AuthenticatedRequest, res) => {
+    const authHeader = req.headers.authorization;
+    const rawToken =
+      authHeader && authHeader.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : typeof req.query.token === 'string'
+          ? req.query.token.trim()
+          : '';
+    if (!rawToken) {
+      return sendApiError(res, 401, 'UNAUTHORIZED', 'Missing access token for event stream', req.correlationId);
+    }
+    const claims = verifyAccessToken(rawToken);
+    if (!claims) {
+      return sendApiError(res, 401, 'UNAUTHORIZED', 'Invalid or expired access token', req.correlationId);
+    }
+    const session = dbStore.sessions.get(claims.sid);
+    if (!session || session.revokedAt) {
+      return sendApiError(res, 401, 'SESSION_REVOKED', 'Session has been revoked', req.correlationId);
+    }
+    const user = dbStore.users.get(claims.sub);
+    if (!user) {
+      return sendApiError(res, 401, 'UNAUTHORIZED', 'User not found', req.correlationId);
+    }
+    subscribeSseClient({
+      userId: user.id,
+      role: user.role,
+      res,
+      syncRevision: dbStore.syncRevision,
+      syncedAt: dbStore.lastSyncedAt,
+    });
+  });
+
+  // Cloud Sync endpoints (quick refresh button + multi-device reconciliation)
+  router.get('/sync', requireAuth, async (req: AuthenticatedRequest, res) => {
+    const force = req.query.force === 'true';
+    const synced = await dbStore.syncFromCloud(force);
+    const invariant = ledgerService.verifyGlobalInvariant();
+    const isAdmin = ADMIN_ROLES.includes(req.authUser!.role);
+    res.json({
+      syncedAt: synced.syncedAt,
+      syncRevision: synced.syncRevision,
+      cloudBackend: synced.cloudBackend,
+      ledgerBalanced: invariant.valid,
+      ...(isAdmin
+        ? {
+            counts: {
+              pendingDeposits: [...dbStore.depositRequests.values()].filter(
+                (d) => d.status === DepositStatus.PENDING || d.status === DepositStatus.MAKER_APPROVED,
+              ).length,
+              pendingWithdrawals: [...dbStore.withdrawalRequests.values()].filter(
+                (w) =>
+                  w.status === WithdrawalStatus.PENDING ||
+                  w.status === WithdrawalStatus.MAKER_APPROVED ||
+                  w.status === WithdrawalStatus.CHECKER_APPROVED,
+              ).length,
+              pendingKyc: [...dbStore.users.values()].filter(
+                (u) => !ADMIN_ROLES.includes(u.role) && (u.kycStatus === 'PENDING' || u.kycStatus === 'NEEDS_MORE_INFO'),
+              ).length,
+            },
+          }
+        : {}),
+    });
+  });
+
+  router.post('/sync', requireAuth, async (req: AuthenticatedRequest, res) => {
+    const synced = await dbStore.syncFromCloud(true);
+    const invariant = ledgerService.verifyGlobalInvariant();
+    const isAdmin = ADMIN_ROLES.includes(req.authUser!.role);
+    broadcastSyncEvent({
+      type: 'CLOUD_SYNCED',
+      syncRevision: synced.syncRevision,
+      syncedAt: synced.syncedAt,
+      targetUserIds: [req.authUser!.id],
+      notifyAdmins: isAdmin,
+    });
+    res.json({
+      syncedAt: synced.syncedAt,
+      syncRevision: synced.syncRevision,
+      cloudBackend: synced.cloudBackend,
+      ledgerBalanced: invariant.valid,
+      ...(isAdmin
+        ? {
+            counts: {
+              pendingDeposits: [...dbStore.depositRequests.values()].filter(
+                (d) => d.status === DepositStatus.PENDING || d.status === DepositStatus.MAKER_APPROVED,
+              ).length,
+              pendingWithdrawals: [...dbStore.withdrawalRequests.values()].filter(
+                (w) =>
+                  w.status === WithdrawalStatus.PENDING ||
+                  w.status === WithdrawalStatus.MAKER_APPROVED ||
+                  w.status === WithdrawalStatus.CHECKER_APPROVED,
+              ).length,
+              pendingKyc: [...dbStore.users.values()].filter(
+                (u) => !ADMIN_ROLES.includes(u.role) && (u.kycStatus === 'PENDING' || u.kycStatus === 'NEEDS_MORE_INFO'),
+              ).length,
+            },
+          }
+        : {}),
+    });
   });
 
   // ==================== AUTH ====================
@@ -538,7 +646,10 @@ export function createV1Router(): Router {
   });
 
   // ==================== ACCOUNTS ====================
-  router.get('/accounts', requireAuth, (req: AuthenticatedRequest, res) => {
+  router.get('/accounts', requireAuth, async (req: AuthenticatedRequest, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     const user = dbStore.users.get(req.authUser!.id);
     const accounts = accountsService.listUserAccounts(req.authUser!.id).map((acc) => {
       const withdrawalRule = rulesService.getLimitRule(
@@ -567,8 +678,11 @@ export function createV1Router(): Router {
     res.json({ accounts });
   });
 
-  router.get('/accounts/:id/balance', requireAuth, requireViewStepUp, (req: AuthenticatedRequest, res) => {
+  router.get('/accounts/:id/balance', requireAuth, requireViewStepUp, async (req: AuthenticatedRequest, res) => {
     try {
+      if (dbStore.getCloudBackend() === 'firestore') {
+        await dbStore.syncFromCloud();
+      }
       const bal = accountsService.getVerifiedBalance(req.authUser!.id, String(req.params.id));
       res.json(bal);
     } catch (err) {
@@ -602,7 +716,10 @@ export function createV1Router(): Router {
   });
 
   // ==================== TRANSACTIONS, DEPOSITS, TRANSFERS, WITHDRAWALS ====================
-  router.get('/transactions', requireAuth, (req: AuthenticatedRequest, res) => {
+  router.get('/transactions', requireAuth, async (req: AuthenticatedRequest, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     const accountId = typeof req.query.accountId === 'string' ? req.query.accountId : undefined;
     const txns = transactionsService.listUserTransactions(req.authUser!.id, accountId);
     res.json({ transactions: txns });
@@ -619,7 +736,10 @@ export function createV1Router(): Router {
     }
   });
 
-  router.get('/deposits/requests', requireAuth, (req: AuthenticatedRequest, res) => {
+  router.get('/deposits/requests', requireAuth, async (req: AuthenticatedRequest, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     res.json({ deposits: transactionsService.listDepositsForUser(req.authUser!.id) });
   });
 
@@ -682,7 +802,10 @@ export function createV1Router(): Router {
     },
   );
 
-  router.get('/withdrawals/requests', requireAuth, (req: AuthenticatedRequest, res) => {
+  router.get('/withdrawals/requests', requireAuth, async (req: AuthenticatedRequest, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     res.json({ withdrawals: transactionsService.listWithdrawalsForUser(req.authUser!.id) });
   });
 
@@ -801,11 +924,17 @@ export function createV1Router(): Router {
   });
 
   // ==================== ADMIN BACK-OFFICE ====================
-  router.get('/admin/overview', requireAuth, requirePermission('transactions:read'), (_req, res) => {
+  router.get('/admin/overview', requireAuth, requirePermission('transactions:read'), async (_req, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     res.json(adminService.getOverviewMetrics());
   });
 
-  router.get('/admin/kyc', requireAuth, requirePermission('kyc:read'), (_req, res) => {
+  router.get('/admin/kyc', requireAuth, requirePermission('kyc:read'), async (_req, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     res.json({ queue: kycService.listKycQueueForOfficer() });
   });
 
@@ -827,7 +956,10 @@ export function createV1Router(): Router {
     }
   });
 
-  router.get('/admin/deposits', requireAuth, requirePermission('deposits:read'), (_req, res) => {
+  router.get('/admin/deposits', requireAuth, requirePermission('deposits:read'), async (_req, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     const items = [...dbStore.depositRequests.values()]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .map((d) => {
@@ -843,16 +975,52 @@ export function createV1Router(): Router {
   });
 
   router.post('/admin/deposits/:id/approve', requireAuth, async (req: AuthenticatedRequest, res) => {
-    const dep = dbStore.depositRequests.get(String(req.params.id));
+    const depositId = String(req.params.id);
+    const idemHeader = req.headers['idempotency-key'];
+    const idemKey = typeof idemHeader === 'string' && idemHeader.trim() ? idemHeader.trim() : null;
+    if (idemKey) {
+      try {
+        const hitCheck = dbStore.checkIdempotency('adm_dep_app', req.authUser!.id, idemKey, {
+          depositId,
+          expectedStatus: req.body?.expectedStatus || null,
+        });
+        if (hitCheck.hit) {
+          return res.status(hitCheck.record.statusCode).json(hitCheck.record.body);
+        }
+      } catch (err) {
+        return handleError(req, res, err);
+      }
+    }
+
+    const dep = dbStore.depositRequests.get(depositId);
     if (!dep) return sendApiError(res, 404, 'NOT_FOUND', 'Deposit request not found.', req.correlationId);
+    const expectedStatus = req.body?.expectedStatus as DepositStatus | undefined;
 
     try {
       if (dep.status === DepositStatus.PENDING) {
         return requirePermission('deposits:make')(req, res, () =>
           requireAdminPinStepUp('deposit_approve')(req, res, async () => {
             try {
-              const updated = await transactionsService.makerApproveDeposit(dep.id, req.authUser!.id, req.body?.notes);
-              res.json({ deposit: updated });
+              const updated = await transactionsService.makerApproveDeposit(dep.id, req.authUser!.id, req.body?.notes, expectedStatus);
+              const payload = { deposit: updated };
+              if (idemKey) {
+                const slot = dbStore.checkIdempotency('adm_dep_app', req.authUser!.id, idemKey, {
+                  depositId,
+                  expectedStatus: req.body?.expectedStatus || null,
+                });
+                if (!slot.hit) {
+                  dbStore.recordIdempotencyResponse({
+                    cacheKey: slot.cacheKey,
+                    scope: 'adm_dep_app',
+                    userId: req.authUser!.id,
+                    key: idemKey,
+                    payloadHash: slot.payloadHash,
+                    statusCode: 200,
+                    body: payload,
+                  });
+                }
+              }
+              res.json(payload);
             } catch (e) {
               handleError(req, res, e);
             }
@@ -862,8 +1030,26 @@ export function createV1Router(): Router {
       return requirePermission('deposits:check')(req, res, () =>
         requireAdminPinStepUp('deposit_approve')(req, res, async () => {
           try {
-            const updated = await transactionsService.checkerApproveDeposit(dep.id, req.authUser!.id, req.body?.notes);
-            res.json({ deposit: updated });
+            const updated = await transactionsService.checkerApproveDeposit(dep.id, req.authUser!.id, req.body?.notes, expectedStatus);
+            const payload = { deposit: updated };
+            if (idemKey) {
+              const slot = dbStore.checkIdempotency('adm_dep_app', req.authUser!.id, idemKey, {
+                depositId,
+                expectedStatus: req.body?.expectedStatus || null,
+              });
+              if (!slot.hit) {
+                dbStore.recordIdempotencyResponse({
+                  cacheKey: slot.cacheKey,
+                  scope: 'adm_dep_app',
+                  userId: req.authUser!.id,
+                  key: idemKey,
+                  payloadHash: slot.payloadHash,
+                  statusCode: 200,
+                  body: payload,
+                });
+              }
+            }
+            res.json(payload);
           } catch (e) {
             handleError(req, res, e);
           }
@@ -875,15 +1061,47 @@ export function createV1Router(): Router {
   });
 
   router.post('/admin/deposits/:id/reject', requireAuth, requirePermission('deposits:make'), requireAdminPinStepUp('deposit_reject'), async (req: AuthenticatedRequest, res) => {
+    const depositId = String(req.params.id);
+    const idemHeader = req.headers['idempotency-key'];
+    const idemKey = typeof idemHeader === 'string' && idemHeader.trim() ? idemHeader.trim() : null;
     try {
-      const updated = await transactionsService.rejectDeposit(String(req.params.id), req.authUser!.id, String(req.body?.reason || ''));
-      res.json({ deposit: updated });
+      let idemSlot: { hit: false; cacheKey: string; payloadHash: string } | null = null;
+      if (idemKey) {
+        const chk = dbStore.checkIdempotency('adm_dep_rej', req.authUser!.id, idemKey, {
+          depositId,
+          reason: String(req.body?.reason || ''),
+        });
+        if (chk.hit) return res.status(chk.record.statusCode).json(chk.record.body);
+        idemSlot = chk;
+      }
+      const updated = await transactionsService.rejectDeposit(
+        depositId,
+        req.authUser!.id,
+        String(req.body?.reason || ''),
+        req.body?.expectedStatus as DepositStatus | undefined,
+      );
+      const payload = { deposit: updated };
+      if (idemSlot && idemKey) {
+        dbStore.recordIdempotencyResponse({
+          cacheKey: idemSlot.cacheKey,
+          scope: 'adm_dep_rej',
+          userId: req.authUser!.id,
+          key: idemKey,
+          payloadHash: idemSlot.payloadHash,
+          statusCode: 200,
+          body: payload,
+        });
+      }
+      res.json(payload);
     } catch (err) {
       handleError(req, res, err);
     }
   });
 
-  router.get('/admin/withdrawals', requireAuth, requirePermission('withdrawals:read'), (_req, res) => {
+  router.get('/admin/withdrawals', requireAuth, requirePermission('withdrawals:read'), async (_req, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     const items = [...dbStore.withdrawalRequests.values()]
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .map((w) => {
@@ -900,14 +1118,51 @@ export function createV1Router(): Router {
   });
 
   router.post('/admin/withdrawals/:id/approve', requireAuth, async (req: AuthenticatedRequest, res) => {
-    const wdr = dbStore.withdrawalRequests.get(String(req.params.id));
+    const withdrawalId = String(req.params.id);
+    const idemHeader = req.headers['idempotency-key'];
+    const idemKey = typeof idemHeader === 'string' && idemHeader.trim() ? idemHeader.trim() : null;
+    if (idemKey) {
+      try {
+        const hitCheck = dbStore.checkIdempotency('adm_wdr_app', req.authUser!.id, idemKey, {
+          withdrawalId,
+          expectedStatus: req.body?.expectedStatus || null,
+        });
+        if (hitCheck.hit) {
+          return res.status(hitCheck.record.statusCode).json(hitCheck.record.body);
+        }
+      } catch (err) {
+        return handleError(req, res, err);
+      }
+    }
+
+    const wdr = dbStore.withdrawalRequests.get(withdrawalId);
     if (!wdr) return sendApiError(res, 404, 'NOT_FOUND', 'Withdrawal not found.', req.correlationId);
+    const expectedStatus = req.body?.expectedStatus as WithdrawalStatus | undefined;
+
     if (wdr.status === WithdrawalStatus.PENDING) {
       return requirePermission('withdrawals:make')(req, res, () =>
         requireAdminPinStepUp('withdrawal_approve')(req, res, async () => {
           try {
-            const updated = await transactionsService.makerApproveWithdrawal(wdr.id, req.authUser!.id);
-            res.json({ withdrawal: updated });
+            const updated = await transactionsService.makerApproveWithdrawal(wdr.id, req.authUser!.id, expectedStatus);
+            const payload = { withdrawal: updated };
+            if (idemKey) {
+              const slot = dbStore.checkIdempotency('adm_wdr_app', req.authUser!.id, idemKey, {
+                withdrawalId,
+                expectedStatus: req.body?.expectedStatus || null,
+              });
+              if (!slot.hit) {
+                dbStore.recordIdempotencyResponse({
+                  cacheKey: slot.cacheKey,
+                  scope: 'adm_wdr_app',
+                  userId: req.authUser!.id,
+                  key: idemKey,
+                  payloadHash: slot.payloadHash,
+                  statusCode: 200,
+                  body: payload,
+                });
+              }
+            }
+            res.json(payload);
           } catch (e) {
             handleError(req, res, e);
           }
@@ -917,8 +1172,26 @@ export function createV1Router(): Router {
     return requirePermission('withdrawals:check')(req, res, () =>
       requireAdminPinStepUp('withdrawal_approve')(req, res, async () => {
         try {
-          const updated = await transactionsService.checkerApproveWithdrawal(wdr.id, req.authUser!.id);
-          res.json({ withdrawal: updated });
+          const updated = await transactionsService.checkerApproveWithdrawal(wdr.id, req.authUser!.id, expectedStatus);
+          const payload = { withdrawal: updated };
+          if (idemKey) {
+            const slot = dbStore.checkIdempotency('adm_wdr_app', req.authUser!.id, idemKey, {
+              withdrawalId,
+              expectedStatus: req.body?.expectedStatus || null,
+            });
+            if (!slot.hit) {
+              dbStore.recordIdempotencyResponse({
+                cacheKey: slot.cacheKey,
+                scope: 'adm_wdr_app',
+                userId: req.authUser!.id,
+                key: idemKey,
+                payloadHash: slot.payloadHash,
+                statusCode: 200,
+                body: payload,
+              });
+            }
+          }
+          res.json(payload);
         } catch (e) {
           handleError(req, res, e);
         }
@@ -927,32 +1200,85 @@ export function createV1Router(): Router {
   });
 
   router.post('/admin/withdrawals/:id/mark-paid', requireAuth, requirePermission('withdrawals:payout'), requireAdminPinStepUp('withdrawal_payout'), async (req: AuthenticatedRequest, res) => {
+    const withdrawalId = String(req.params.id);
+    const idemHeader = req.headers['idempotency-key'];
+    const idemKey = typeof idemHeader === 'string' && idemHeader.trim() ? idemHeader.trim() : null;
     try {
+      let idemSlot: { hit: false; cacheKey: string; payloadHash: string } | null = null;
+      if (idemKey) {
+        const chk = dbStore.checkIdempotency('adm_wdr_paid', req.authUser!.id, idemKey, {
+          withdrawalId,
+          payoutReference: String(req.body?.payoutReference || ''),
+        });
+        if (chk.hit) return res.status(chk.record.statusCode).json(chk.record.body);
+        idemSlot = chk;
+      }
       const updated = await transactionsService.markWithdrawalPaid(
-        String(req.params.id),
+        withdrawalId,
         req.authUser!.id,
         String(req.body?.payoutReference || ''),
+        req.body?.expectedStatus as WithdrawalStatus | undefined,
       );
-      res.json({ withdrawal: updated });
+      const payload = { withdrawal: updated };
+      if (idemSlot && idemKey) {
+        dbStore.recordIdempotencyResponse({
+          cacheKey: idemSlot.cacheKey,
+          scope: 'adm_wdr_paid',
+          userId: req.authUser!.id,
+          key: idemKey,
+          payloadHash: idemSlot.payloadHash,
+          statusCode: 200,
+          body: payload,
+        });
+      }
+      res.json(payload);
     } catch (err) {
       handleError(req, res, err);
     }
   });
 
   router.post('/admin/withdrawals/:id/reject', requireAuth, requirePermission('withdrawals:make'), requireAdminPinStepUp('withdrawal_reject'), async (req: AuthenticatedRequest, res) => {
+    const withdrawalId = String(req.params.id);
+    const idemHeader = req.headers['idempotency-key'];
+    const idemKey = typeof idemHeader === 'string' && idemHeader.trim() ? idemHeader.trim() : null;
     try {
+      let idemSlot: { hit: false; cacheKey: string; payloadHash: string } | null = null;
+      if (idemKey) {
+        const chk = dbStore.checkIdempotency('adm_wdr_rej', req.authUser!.id, idemKey, {
+          withdrawalId,
+          reason: String(req.body?.reason || ''),
+        });
+        if (chk.hit) return res.status(chk.record.statusCode).json(chk.record.body);
+        idemSlot = chk;
+      }
       const updated = await transactionsService.rejectWithdrawal(
-        String(req.params.id),
+        withdrawalId,
         req.authUser!.id,
         String(req.body?.reason || ''),
+        req.body?.expectedStatus as WithdrawalStatus | undefined,
       );
-      res.json({ withdrawal: updated });
+      const payload = { withdrawal: updated };
+      if (idemSlot && idemKey) {
+        dbStore.recordIdempotencyResponse({
+          cacheKey: idemSlot.cacheKey,
+          scope: 'adm_wdr_rej',
+          userId: req.authUser!.id,
+          key: idemKey,
+          payloadHash: idemSlot.payloadHash,
+          statusCode: 200,
+          body: payload,
+        });
+      }
+      res.json(payload);
     } catch (err) {
       handleError(req, res, err);
     }
   });
 
-  router.get('/admin/users', requireAuth, requirePermission('users:read'), (req, res) => {
+  router.get('/admin/users', requireAuth, requirePermission('users:read'), async (req, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     const q = String(req.query.q || '').trim().toLowerCase();
     const list = [...dbStore.users.values()]
       .filter((u) => {
@@ -1020,7 +1346,10 @@ export function createV1Router(): Router {
     }
   });
 
-  router.get('/admin/transactions', requireAuth, requirePermission('transactions:read'), (req, res) => {
+  router.get('/admin/transactions', requireAuth, requirePermission('transactions:read'), async (req, res) => {
+    if (dbStore.getCloudBackend() === 'firestore') {
+      await dbStore.syncFromCloud();
+    }
     const q = String(req.query.q || '').trim().toLowerCase();
     const txns = [...dbStore.transactions.values()]
       .filter((t) => !q || t.reference.toLowerCase().includes(q) || t.id.toLowerCase().includes(q))
@@ -1034,13 +1363,40 @@ export function createV1Router(): Router {
   });
 
   router.post('/admin/transactions/:id/reverse', requireAuth, requirePermission('transactions:reverse'), requireAdminPinStepUp('transaction_reverse'), async (req: AuthenticatedRequest, res) => {
+    const txnId = String(req.params.id);
+    const idemHeader = req.headers['idempotency-key'];
+    const idemKey = typeof idemHeader === 'string' && idemHeader.trim() ? idemHeader.trim() : `rev_${txnId}`;
     try {
+      const idemChk = dbStore.checkIdempotency('adm_txn_rev', req.authUser!.id, idemKey, {
+        txnId,
+        reason: String(req.body?.reason || 'Administrative reversal'),
+      });
+      if (idemChk.hit) {
+        return res.status(idemChk.record.statusCode).json(idemChk.record.body);
+      }
       const rev = await ledgerService.reverseTransaction(
-        String(req.params.id),
+        txnId,
         String(req.body?.reason || 'Administrative reversal'),
-        `rev_${req.params.id}_${Date.now()}`,
+        `rev_${txnId}_${idemKey}`,
       );
-      res.status(201).json({ reversal: rev });
+      const payload = { reversal: rev };
+      dbStore.recordIdempotencyResponse({
+        cacheKey: idemChk.cacheKey,
+        scope: 'adm_txn_rev',
+        userId: req.authUser!.id,
+        key: idemKey,
+        payloadHash: idemChk.payloadHash,
+        statusCode: 201,
+        body: payload,
+      });
+      broadcastSyncEvent({
+        type: 'TRANSACTION_REVERSED',
+        syncRevision: dbStore.syncRevision,
+        syncedAt: dbStore.lastSyncedAt,
+        entityId: txnId,
+        notifyAdmins: true,
+      });
+      res.status(201).json(payload);
     } catch (err) {
       handleError(req, res, err);
     }

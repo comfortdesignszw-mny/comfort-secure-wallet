@@ -10,6 +10,7 @@ import {
   DepositRequestRecord,
   DepositStatus,
   FeeRuleRecord,
+  IdempotencyRecord,
   JournalDirection,
   JournalEntryRecord,
   JournalLineRecord,
@@ -28,9 +29,11 @@ import {
   RbacRuleRecord,
   ReconciliationRunRecord,
   RiskFlagRecord,
+  RiskSeverity,
   Role,
   SessionRecord,
   SupportNoteRecord,
+  SyncSnapshotResponse,
   TransactionRecord,
   TransactionStatus,
   TransactionType,
@@ -74,6 +77,13 @@ import {
   verifyPasswordEdge,
   verifyPinEdge,
 } from './edge-crypto.ts';
+import {
+  EdgeCloudWrite,
+  commitCloudWrites,
+  getCloudBackendType,
+  getCloudDoc,
+  listCloudCollection,
+} from './edge-firestore.ts';
 
 export interface CloudflareKvLike {
   get(key: string): Promise<string | null>;
@@ -88,6 +98,7 @@ export interface CloudflareEnv {
   WALLET_FIELD_ENCRYPTION_KEY?: string;
   WALLET_SIGNED_URL_SECRET?: string;
   SUPER_ADMIN_EMAIL?: string;
+  FIREBASE_SERVICE_ACCOUNT_JSON?: string;
   RESEND_API_KEY?: string;
   RESEND_FROM_EMAIL?: string;
   AFRICASTALKING_API_KEY?: string;
@@ -136,7 +147,10 @@ interface EdgeState {
   reconciliationRuns: Map<string, ReconciliationRunRecord>;
   supportNotes: Map<string, SupportNoteRecord>;
   usedStepUpTokens: Set<string>;
-  idempotencyResponses: Map<string, { statusCode: number; body: unknown; userId: string }>;
+  idempotencyResponses: Map<string, IdempotencyRecord>;
+  syncRevision: number;
+  lastSyncedAt: string;
+  lastCloudPullMs: number;
 }
 
 const edgeState: EdgeState = {
@@ -166,6 +180,9 @@ const edgeState: EdgeState = {
   supportNotes: new Map(),
   usedStepUpTokens: new Set(),
   idempotencyResponses: new Map(),
+  syncRevision: 1,
+  lastSyncedAt: new Date().toISOString(),
+  lastCloudPullMs: 0,
 };
 
 function initDefaultRulesAndLedger() {
@@ -415,6 +432,342 @@ async function buildVaultCookie(
   });
 }
 
+async function canonicalPayloadHashEdge(payload: unknown): Promise<string> {
+  const stableStringify = (val: unknown): string => {
+    if (val === null || typeof val !== 'object') return JSON.stringify(val);
+    if (Array.isArray(val)) return `[${val.map(stableStringify).join(',')}]`;
+    const entries = Object.entries(val as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`;
+  };
+  return sha256HexEdge(stableStringify(payload));
+}
+
+async function checkIdempotencyEdge(
+  env: CloudflareEnv,
+  scope: string,
+  userId: string,
+  key: string,
+  payload: unknown,
+): Promise<
+  | { status: 'HIT'; record: IdempotencyRecord }
+  | { status: 'CONFLICT' }
+  | { status: 'MISS'; cacheKey: string; payloadHash: string }
+> {
+  const cacheKey = `${scope}:${userId}:${key}`;
+  const payloadHash = await canonicalPayloadHashEdge(payload);
+  let existing = edgeState.idempotencyResponses.get(cacheKey);
+  if (!existing && getCloudBackendType(env) !== 'memory') {
+    const cloudDoc = await getCloudDoc(env, 'idempotency_keys', cacheKey).catch(() => null);
+    if (cloudDoc) {
+      existing = cloudDoc as unknown as IdempotencyRecord;
+      edgeState.idempotencyResponses.set(cacheKey, existing);
+    }
+  }
+  if (existing) {
+    if (existing.payloadHash && existing.payloadHash !== payloadHash) {
+      return { status: 'CONFLICT' };
+    }
+    return { status: 'HIT', record: existing };
+  }
+  return { status: 'MISS', cacheKey, payloadHash };
+}
+
+async function persistEdgeWrites(
+  env: CloudflareEnv,
+  writes: EdgeCloudWrite[],
+  bumpRevision = true,
+): Promise<number> {
+  if (bumpRevision) {
+    edgeState.syncRevision += 1;
+    edgeState.lastSyncedAt = new Date().toISOString();
+  }
+  if (getCloudBackendType(env) === 'memory') {
+    return edgeState.syncRevision;
+  }
+  const allWrites: EdgeCloudWrite[] = bumpRevision
+    ? [
+        ...writes,
+        {
+          collection: 'system_meta',
+          id: 'sync_state',
+          data: { syncRevision: edgeState.syncRevision, updatedAt: edgeState.lastSyncedAt },
+        },
+      ]
+    : writes;
+  const result = await commitCloudWrites(env, allWrites);
+  if (!result.ok) {
+    if (result.conflict) {
+      throw new Error('IDEMPOTENCY_CONFLICT: This transaction or state change was already processed.');
+    }
+    throw new Error(`CLOUD_SYNC_ERROR: ${result.error || 'Failed to persist transaction to cloud database.'}`);
+  }
+  return edgeState.syncRevision;
+}
+
+const EDGE_TERMINAL_DEPOSIT = new Set<string>([DepositStatus.APPROVED, DepositStatus.REJECTED]);
+const EDGE_TERMINAL_WITHDRAWAL = new Set<string>([WithdrawalStatus.PAID, WithdrawalStatus.REJECTED]);
+
+async function syncEdgeFromCloud(
+  env: CloudflareEnv,
+  force = false,
+): Promise<{ syncRevision: number; syncedAt: string; cloudBackend: 'firestore' | 'kv' | 'memory' }> {
+  const backend = getCloudBackendType(env);
+  if (backend === 'memory') {
+    edgeState.lastSyncedAt = new Date().toISOString();
+    return {
+      syncRevision: edgeState.syncRevision,
+      syncedAt: edgeState.lastSyncedAt,
+      cloudBackend: 'memory',
+    };
+  }
+
+  const nowMs = Date.now();
+  if (!force && nowMs - edgeState.lastCloudPullMs < 1500) {
+    return {
+      syncRevision: edgeState.syncRevision,
+      syncedAt: edgeState.lastSyncedAt,
+      cloudBackend: backend,
+    };
+  }
+
+  try {
+    const meta = await getCloudDoc(env, 'system_meta', 'sync_state').catch(() => null);
+    const cloudRev = Number((meta?.syncRevision as number | undefined) || 0);
+    if (!force && cloudRev > 0 && cloudRev <= edgeState.syncRevision && edgeState.lastCloudPullMs > 0) {
+      edgeState.lastCloudPullMs = nowMs;
+      edgeState.lastSyncedAt = new Date().toISOString();
+      return { syncRevision: edgeState.syncRevision, syncedAt: edgeState.lastSyncedAt, cloudBackend: backend };
+    }
+
+    const [
+      usersDocs,
+      profilesDocs,
+      kycDocs,
+      pinsDocs,
+      sessionsDocs,
+      accountsDocs,
+      ledgerDocs,
+      txnDocs,
+      jeDocs,
+      jlDocs,
+      depDocs,
+      wdrDocs,
+      notifDocs,
+      feeDocs,
+      limitDocs,
+      approvalDocs,
+      riskDocs,
+      reconDocs,
+      noteDocs,
+      auditDocs,
+    ] = await Promise.all([
+      listCloudCollection(env, 'users'),
+      listCloudCollection(env, 'user_profiles'),
+      listCloudCollection(env, 'kyc_documents'),
+      listCloudCollection(env, 'pins'),
+      listCloudCollection(env, 'sessions'),
+      listCloudCollection(env, 'accounts'),
+      listCloudCollection(env, 'ledger_accounts'),
+      listCloudCollection(env, 'transactions'),
+      listCloudCollection(env, 'journal_entries'),
+      listCloudCollection(env, 'journal_lines'),
+      listCloudCollection(env, 'deposit_requests'),
+      listCloudCollection(env, 'withdrawal_requests'),
+      listCloudCollection(env, 'notifications'),
+      listCloudCollection(env, 'fee_rules'),
+      listCloudCollection(env, 'limit_rules'),
+      listCloudCollection(env, 'approvals'),
+      listCloudCollection(env, 'risk_flags'),
+      listCloudCollection(env, 'reconciliation_runs'),
+      listCloudCollection(env, 'support_notes'),
+      listCloudCollection(env, 'audit_logs'),
+    ]);
+
+    for (const { id, data } of usersDocs) {
+      const incoming = data as unknown as UserRecord;
+      const local = edgeState.users.get(id);
+      if (!local || (incoming.version ?? 0) > (local.version ?? 0)) {
+        edgeState.users.set(id, { ...local, ...incoming });
+      }
+    }
+    for (const { id, data } of profilesDocs) {
+      const incoming = data as unknown as UserProfileRecord;
+      const local = edgeState.profiles.get(id);
+      if (!local || (incoming.updatedAt || '') > (local.updatedAt || '')) {
+        edgeState.profiles.set(id, incoming);
+      }
+    }
+    for (const { id, data } of kycDocs) {
+      const incoming = data as unknown as KycDocumentRecord;
+      const local = edgeState.kycDocs.get(id);
+      if (!local || (incoming.reviewedAt && !local.reviewedAt)) {
+        edgeState.kycDocs.set(id, incoming);
+      }
+    }
+    for (const { id, data } of pinsDocs) {
+      const incoming = data as unknown as PinRecord;
+      const local = edgeState.pins.get(id);
+      if (!local || (incoming.updatedAt || '') > (local.updatedAt || '')) {
+        edgeState.pins.set(id, incoming);
+      }
+    }
+    for (const { id, data } of sessionsDocs) {
+      const incoming = data as unknown as SessionRecord;
+      const local = edgeState.sessions.get(id);
+      if (!local || (incoming.revokedAt && !local.revokedAt)) {
+        edgeState.sessions.set(id, incoming);
+      }
+    }
+    for (const { id, data } of accountsDocs) {
+      const incoming = data as unknown as AccountRecord;
+      const local = edgeState.accounts.get(id);
+      if (!local || (incoming.version ?? 0) > (local.version ?? 0)) {
+        edgeState.accounts.set(id, incoming);
+      }
+    }
+    for (const { id, data } of ledgerDocs) {
+      if (!edgeState.ledgerAccounts.has(id)) {
+        edgeState.ledgerAccounts.set(id, data as unknown as LedgerAccountRecord);
+      }
+    }
+    const knownJe = new Set(edgeState.journalEntries.map((e) => e.id));
+    for (const { id, data } of jeDocs) {
+      if (!knownJe.has(id)) {
+        edgeState.journalEntries.push(data as unknown as JournalEntryRecord);
+        knownJe.add(id);
+      }
+    }
+    const knownJl = new Set(edgeState.journalLines.map((l) => l.id));
+    for (const { id, data } of jlDocs) {
+      if (!knownJl.has(id)) {
+        edgeState.journalLines.push(data as unknown as JournalLineRecord);
+        knownJl.add(id);
+      }
+    }
+    for (const { id, data } of txnDocs) {
+      const incoming = data as unknown as TransactionRecord;
+      const local = edgeState.transactions.get(id);
+      if (!local || (incoming.status === TransactionStatus.REVERSED && local.status !== TransactionStatus.REVERSED)) {
+        edgeState.transactions.set(id, incoming);
+      }
+    }
+    for (const { id, data } of depDocs) {
+      const incoming = data as unknown as DepositRequestRecord;
+      const local = edgeState.depositRequests.get(id);
+      const shouldReplace =
+        !local ||
+        (incoming.version ?? 0) > (local.version ?? 0) ||
+        (EDGE_TERMINAL_DEPOSIT.has(incoming.status) && !EDGE_TERMINAL_DEPOSIT.has(local.status));
+      if (shouldReplace) {
+        edgeState.depositRequests.set(id, incoming);
+      }
+    }
+    for (const { id, data } of wdrDocs) {
+      const incoming = data as unknown as WithdrawalRequestRecord;
+      const local = edgeState.withdrawalRequests.get(id);
+      const shouldReplace =
+        !local ||
+        (incoming.version ?? 0) > (local.version ?? 0) ||
+        (EDGE_TERMINAL_WITHDRAWAL.has(incoming.status) && !EDGE_TERMINAL_WITHDRAWAL.has(local.status));
+      if (shouldReplace) {
+        edgeState.withdrawalRequests.set(id, incoming);
+      }
+    }
+    for (const { id, data } of notifDocs) {
+      const incoming = data as unknown as NotificationRecord;
+      if (!edgeState.notifications.has(id)) {
+        edgeState.notifications.set(id, incoming);
+      }
+    }
+    for (const { id, data } of feeDocs) {
+      const incoming = data as unknown as FeeRuleRecord;
+      const local = edgeState.feeRules.get(id);
+      if (!local || (incoming.updatedAt || '') > (local.updatedAt || '')) {
+        edgeState.feeRules.set(id, incoming);
+      }
+    }
+    for (const { id, data } of limitDocs) {
+      const incoming = data as unknown as LimitRuleRecord;
+      const local = edgeState.limitRules.get(id);
+      if (!local || (incoming.updatedAt || '') > (local.updatedAt || '')) {
+        edgeState.limitRules.set(id, incoming);
+      }
+    }
+    for (const { id, data } of approvalDocs) {
+      const incoming = data as unknown as ApprovalRecord;
+      const local = edgeState.approvals.get(id);
+      if (!local || (incoming.status !== 'PENDING' && local.status === 'PENDING')) {
+        edgeState.approvals.set(id, incoming);
+      }
+    }
+    for (const { id, data } of riskDocs) {
+      const incoming = data as unknown as RiskFlagRecord;
+      const local = edgeState.riskFlags.get(id);
+      if (!local || (incoming.resolvedAt && !local.resolvedAt)) {
+        edgeState.riskFlags.set(id, incoming);
+      }
+    }
+    for (const { id, data } of reconDocs) {
+      const incoming = data as unknown as ReconciliationRunRecord;
+      const local = edgeState.reconciliationRuns.get(id);
+      if (!local || (incoming.status === 'RESOLVED' && local.status !== 'RESOLVED')) {
+        edgeState.reconciliationRuns.set(id, incoming);
+      }
+    }
+    for (const { id, data } of noteDocs) {
+      if (!edgeState.supportNotes.has(id)) {
+        edgeState.supportNotes.set(id, data as unknown as SupportNoteRecord);
+      }
+    }
+    const knownAudits = new Set(edgeState.auditLogs.map((a) => a.id));
+    for (const { id, data } of auditDocs) {
+      if (!knownAudits.has(id)) {
+        edgeState.auditLogs.push(data as unknown as AuditLogRecord);
+        knownAudits.add(id);
+      }
+    }
+
+    // Derive ledger balances deterministically from immutable journal lines
+    for (const la of edgeState.ledgerAccounts.values()) {
+      const isAsset =
+        la.type === LedgerAccountType.BANK_SETTLEMENT ||
+        la.type === LedgerAccountType.SUSPENSE;
+      let bal = 0;
+      let hasLine = false;
+      for (const line of edgeState.journalLines) {
+        if (line.ledgerAccountId !== la.id) continue;
+        hasLine = true;
+        bal += isAsset
+          ? line.direction === JournalDirection.DEBIT
+            ? line.amountMinor
+            : -line.amountMinor
+          : line.direction === JournalDirection.CREDIT
+            ? line.amountMinor
+            : -line.amountMinor;
+      }
+      if (hasLine) {
+        la.cachedBalanceMinor = bal;
+      }
+    }
+
+    if (cloudRev > edgeState.syncRevision) {
+      edgeState.syncRevision = cloudRev;
+    }
+    edgeState.lastCloudPullMs = nowMs;
+    edgeState.lastSyncedAt = new Date().toISOString();
+  } catch {
+    edgeState.lastSyncedAt = new Date().toISOString();
+  }
+
+  return {
+    syncRevision: edgeState.syncRevision,
+    syncedAt: edgeState.lastSyncedAt,
+    cloudBackend: backend,
+  };
+}
+
 async function kvSyncUser(env: CloudflareEnv, userId: string): Promise<void> {
   if (!env.WALLET_KV) return;
   const user = edgeState.users.get(userId);
@@ -521,14 +874,15 @@ function enqueueEdgeNotification(params: {
   template: string;
   title: string;
   body: string;
-}) {
+}): NotificationRecord[] {
   const effective = new Set(params.channels);
   effective.add(NotificationChannel.PUSH);
   effective.add(NotificationChannel.IN_APP);
   const now = new Date().toISOString();
+  const created: NotificationRecord[] = [];
   for (const ch of effective) {
     const id = `ntf_${crypto.randomUUID()}`;
-    edgeState.notifications.set(id, {
+    const rec: NotificationRecord = {
       id,
       userId: params.userId,
       channel: ch,
@@ -540,12 +894,15 @@ function enqueueEdgeNotification(params: {
       readAt: null,
       sentAt: now,
       createdAt: now,
-    });
+    };
+    edgeState.notifications.set(id, rec);
+    created.push(rec);
   }
+  return created;
 }
 
-function addAudit(actorId: string, actorType: AuditLogRecord['actorType'], action: string, entity: string, after?: Record<string, unknown>) {
-  edgeState.auditLogs.push({
+function addAudit(actorId: string, actorType: AuditLogRecord['actorType'], action: string, entity: string, after?: Record<string, unknown>): AuditLogRecord {
+  const rec: AuditLogRecord = {
     id: `aud_${crypto.randomUUID()}`,
     actorId,
     actorType,
@@ -557,7 +914,9 @@ function addAudit(actorId: string, actorType: AuditLogRecord['actorType'], actio
     userAgent: 'PWA-Client',
     correlationId: `cor_${crypto.randomUUID().slice(0, 8)}`,
     createdAt: new Date().toISOString(),
-  });
+  };
+  edgeState.auditLogs.push(rec);
+  return rec;
 }
 
 async function createEdgeSession(
@@ -605,7 +964,7 @@ async function createEdgeSession(
     secrets.refreshSecret,
     7 * 24 * 60 * 60,
   );
-  return { sessionId, accessToken, refreshCookieJwt };
+  return { sessionId, accessToken, refreshCookieJwt, session };
 }
 
 function buildAuthCookies(
@@ -634,6 +993,7 @@ function buildAuthCookies(
 
 async function authenticateEdgeRequest(
   req: Request,
+  env: CloudflareEnv,
   secrets: ReturnType<typeof getEdgeSecrets>,
 ): Promise<{ user: UserRecord; claims: EdgeAccessClaims } | null> {
   const auth = req.headers.get('authorization') || '';
@@ -641,7 +1001,11 @@ async function authenticateEdgeRequest(
   const token = auth.slice(7).trim();
   const claims = await verifyJwtEdge<EdgeAccessClaims>(token, secrets.jwtSecret);
   if (!claims) return null;
-  const user = edgeState.users.get(claims.sub);
+  let user = edgeState.users.get(claims.sub);
+  if (!user && getCloudBackendType(env) !== 'memory') {
+    await syncEdgeFromCloud(env, true);
+    user = edgeState.users.get(claims.sub);
+  }
   if (!user) return null;
   const session = edgeState.sessions.get(claims.sid);
   if (session?.revokedAt) return null;
@@ -735,25 +1099,53 @@ function postAtomicEdgeTransaction(params: {
   idempotencyKey: string;
   description: string;
   legs: Array<{ ledgerAccountId: string; direction: JournalDirection; amountMinor: number; currency: Currency }>;
-}): TransactionRecord {
+  metadata?: Record<string, unknown>;
+}): {
+  txn: TransactionRecord;
+  je: JournalEntryRecord;
+  jl: JournalLineRecord[];
+  touchedLedgerAccounts: LedgerAccountRecord[];
+} {
   let debits = 0;
   let credits = 0;
   for (const l of params.legs) {
     if (l.direction === JournalDirection.DEBIT) debits += l.amountMinor;
     else credits += l.amountMinor;
   }
-  if (debits !== credits) {
+  if (debits !== credits || debits === 0) {
     throw new Error('LEDGER_IMBALANCE: Debits must equal credits.');
   }
 
+  const nextBalances = new Map<string, number>();
   for (const l of params.legs) {
     const la = edgeState.ledgerAccounts.get(l.ledgerAccountId);
     if (!la) throw new Error('LEDGER_ACCOUNT_NOT_FOUND');
-    const next = la.cachedBalanceMinor + (l.direction === JournalDirection.CREDIT ? l.amountMinor : -l.amountMinor);
-    if (la.type === LedgerAccountType.USER_WALLET && next < 0) {
+    const isAsset =
+      la.type === LedgerAccountType.BANK_SETTLEMENT ||
+      la.type === LedgerAccountType.SUSPENSE;
+    const delta = isAsset
+      ? l.direction === JournalDirection.DEBIT
+        ? l.amountMinor
+        : -l.amountMinor
+      : l.direction === JournalDirection.CREDIT
+        ? l.amountMinor
+        : -l.amountMinor;
+    const baseBal = nextBalances.get(la.id) ?? la.cachedBalanceMinor;
+    const next = baseBal + delta;
+    if (
+      (la.type === LedgerAccountType.USER_WALLET || la.type === LedgerAccountType.WITHDRAWAL_HOLD) &&
+      next < 0
+    ) {
       throw new Error('INSUFFICIENT_FUNDS: Wallet balance cannot go negative.');
     }
-    la.cachedBalanceMinor = next;
+    nextBalances.set(la.id, next);
+  }
+
+  const touchedLedgerAccounts: LedgerAccountRecord[] = [];
+  for (const [id, nextBal] of nextBalances.entries()) {
+    const la = edgeState.ledgerAccounts.get(id)!;
+    la.cachedBalanceMinor = nextBal;
+    touchedLedgerAccounts.push(la);
   }
 
   const now = new Date().toISOString();
@@ -768,19 +1160,21 @@ function postAtomicEdgeTransaction(params: {
     toAccountId: params.toAccountId,
     reference: params.reference,
     idempotencyKey: params.idempotencyKey,
-    metadata: { description: params.description },
+    metadata: { description: params.description, ...(params.metadata || {}) },
     createdAt: now,
   };
   edgeState.transactions.set(txn.id, txn);
   const jeId = `je_${crypto.randomUUID()}`;
-  edgeState.journalEntries.push({
+  const je: JournalEntryRecord = {
     id: jeId,
     transactionId: txn.id,
     description: params.description,
     createdAt: now,
-  });
+  };
+  edgeState.journalEntries.push(je);
+  const jl: JournalLineRecord[] = [];
   for (const l of params.legs) {
-    edgeState.journalLines.push({
+    const line: JournalLineRecord = {
       id: `jl_${crypto.randomUUID()}`,
       entryId: jeId,
       ledgerAccountId: l.ledgerAccountId,
@@ -788,9 +1182,25 @@ function postAtomicEdgeTransaction(params: {
       amountMinor: l.amountMinor,
       currency: l.currency,
       createdAt: now,
-    });
+    };
+    edgeState.journalLines.push(line);
+    jl.push(line);
   }
-  return txn;
+  return { txn, je, jl, touchedLedgerAccounts };
+}
+
+function verifyEdgeLedgerInvariant(): { valid: boolean; totalDebitsMinor: number; totalCreditsMinor: number } {
+  let totalDebitsMinor = 0;
+  let totalCreditsMinor = 0;
+  for (const line of edgeState.journalLines) {
+    if (line.direction === JournalDirection.DEBIT) totalDebitsMinor += line.amountMinor;
+    else totalCreditsMinor += line.amountMinor;
+  }
+  return {
+    valid: totalDebitsMinor === totalCreditsMinor,
+    totalDebitsMinor,
+    totalCreditsMinor,
+  };
 }
 
 function getPermissionSet(role: Role): Permission[] {
@@ -884,7 +1294,13 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
   try {
     // Health & Config
     if (method === 'GET' && path === '/health') {
-      return jsonResponse({ status: 'ok', runtime: 'cloudflare-edge', ledgerBalanced: true });
+      return jsonResponse({
+        status: 'ok',
+        runtime: 'cloudflare-edge',
+        cloudBackend: getCloudBackendType(env),
+        syncRevision: edgeState.syncRevision,
+        ledgerBalanced: true,
+      });
     }
     if (method === 'GET' && path === '/docs') {
       return jsonResponse({ openapi: '3.1.0', info: { title: 'Comfort Secure Wallet API', version: '1.0.0' } });
@@ -909,6 +1325,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
 
       const email = parsed.data.email?.trim().toLowerCase() || null;
       const phone = parsed.data.phone?.trim() || null;
+      await syncEdgeFromCloud(env);
       await kvLookupByIdentifier(env, email, phone);
 
       for (const u of edgeState.users.values()) {
@@ -934,11 +1351,14 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         phoneVerified: false,
         totpEnabled: false,
         legalAcceptedAt: now,
+        version: 1,
+        updatedAt: now,
         createdAt: now,
       };
       edgeState.users.set(user.id, user);
+      let profileRec: UserProfileRecord | null = null;
       if (parsed.data.fullName?.trim()) {
-        edgeState.profiles.set(user.id, {
+        profileRec = {
           userId: user.id,
           fullName: parsed.data.fullName.trim(),
           dateOfBirth: '',
@@ -946,7 +1366,8 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
           address: '',
           country: 'ZW',
           updatedAt: now,
-        });
+        };
+        edgeState.profiles.set(user.id, profileRec);
       }
 
       const otpChannel: 'SMS' | 'EMAIL' = phone ? 'SMS' : 'EMAIL';
@@ -969,7 +1390,6 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         });
         otpSent = await sendLiveOtp(env, otpTarget, otpChannel, code);
       } else {
-        // Without external email/SMS API keys, mark initial contact confirmed on signup so onboarding proceeds smoothly to 6-digit PIN setup
         if (otpChannel === 'EMAIL') user.emailVerified = true;
         if (otpChannel === 'SMS') user.phoneVerified = true;
       }
@@ -980,7 +1400,13 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         twoFactorVerified: true,
       });
       await kvSyncUser(env, user.id);
-      addAudit(user.id, 'USER', 'USER_REGISTERED', `user:${user.id}`, { email, phone });
+      const audit = addAudit(user.id, 'USER', 'USER_REGISTERED', `user:${user.id}`, { email, phone });
+      await persistEdgeWrites(env, [
+        { collection: 'users', id: user.id, data: user as unknown as Record<string, unknown> },
+        ...(profileRec ? [{ collection: 'user_profiles', id: user.id, data: profileRec as unknown as Record<string, unknown> }] : []),
+        { collection: 'sessions', id: session.sessionId, data: session.session as unknown as Record<string, unknown> },
+        { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+      ]);
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
 
       return jsonResponse(
@@ -1012,6 +1438,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       }
       const email = parsed.data.email?.trim().toLowerCase() || null;
       const phone = parsed.data.phone?.trim() || null;
+      await syncEdgeFromCloud(env);
       await kvLookupByIdentifier(env, email, phone);
 
       for (const u of edgeState.users.values()) {
@@ -1045,10 +1472,12 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         phoneVerified: false,
         totpEnabled: true,
         legalAcceptedAt: now,
+        version: 1,
+        updatedAt: now,
         createdAt: now,
       };
       edgeState.users.set(user.id, user);
-      edgeState.profiles.set(user.id, {
+      const staffProfile: UserProfileRecord = {
         userId: user.id,
         fullName: parsed.data.fullName.trim(),
         dateOfBirth: '1990-01-01',
@@ -1056,7 +1485,8 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         address: 'Comfort Secure Wallet Staff Office',
         country: 'ZW',
         updatedAt: now,
-      });
+      };
+      edgeState.profiles.set(user.id, staffProfile);
 
       const otpChannel: 'SMS' | 'EMAIL' = email ? 'EMAIL' : 'SMS';
       const otpTarget = (email || phone)!;
@@ -1088,12 +1518,18 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         twoFactorVerified: true,
       });
       await kvSyncUser(env, user.id);
-      addAudit(user.id, isSuperAdmin ? 'ADMIN' : 'SYSTEM', isSuperAdmin ? 'SUPER_ADMIN_BOOTSTRAPPED' : 'STAFF_REGISTERED_PENDING', `user:${user.id}`, {
+      const audit = addAudit(user.id, isSuperAdmin ? 'ADMIN' : 'SYSTEM', isSuperAdmin ? 'SUPER_ADMIN_BOOTSTRAPPED' : 'STAFF_REGISTERED_PENDING', `user:${user.id}`, {
         email,
         phone,
         role: user.role,
         staffStatus: user.staffStatus,
       });
+      await persistEdgeWrites(env, [
+        { collection: 'users', id: user.id, data: user as unknown as Record<string, unknown> },
+        { collection: 'user_profiles', id: user.id, data: staffProfile as unknown as Record<string, unknown> },
+        { collection: 'sessions', id: session.sessionId, data: session.session as unknown as Record<string, unknown> },
+        { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+      ]);
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
 
       return jsonResponse(
@@ -1118,6 +1554,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       }
       const email = parsed.data.email?.trim().toLowerCase() || null;
       const phone = parsed.data.phone?.trim() || null;
+      await syncEdgeFromCloud(env);
       await kvLookupByIdentifier(env, email, phone);
 
       const user = [...edgeState.users.values()].find(
@@ -1203,6 +1640,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       }
       const email = parsed.data.email?.trim().toLowerCase() || null;
       const phone = parsed.data.phone?.trim() || null;
+      await syncEdgeFromCloud(env);
       await kvLookupByIdentifier(env, email, phone);
 
       const user = [...edgeState.users.values()].find(
@@ -1226,6 +1664,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
           pinRec.failedAttempts = 0;
           pinRec.lockoutCount += 1;
         }
+        await persistEdgeWrites(env, [{ collection: 'pins', id: user.id, data: pinRec as unknown as Record<string, unknown> }], false);
         const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
         return jsonResponse(
           { error: { code: 'INVALID_PIN', message: 'Incorrect 6-digit PIN.', correlationId } },
@@ -1242,6 +1681,14 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         twoFactorVerified: true,
       });
       await kvSyncUser(env, user.id);
+      await persistEdgeWrites(
+        env,
+        [
+          { collection: 'pins', id: user.id, data: pinRec as unknown as Record<string, unknown> },
+          { collection: 'sessions', id: session.sessionId, data: session.session as unknown as Record<string, unknown> },
+        ],
+        false,
+      );
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
       return jsonResponse(
         {
@@ -1262,6 +1709,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       }
       const claims = await verifyFirebaseIdTokenEdge(idToken, firebaseConfig.projectId);
       const email = claims.email;
+      await syncEdgeFromCloud(env);
       await kvLookupByIdentifier(env, email, null);
 
       const isStaffEndpoint = path === '/auth/staff/google';
@@ -1301,6 +1749,8 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
           phoneVerified: false,
           totpEnabled: isStaffEndpoint,
           legalAcceptedAt: now,
+          version: 1,
+          updatedAt: now,
           createdAt: now,
         };
         edgeState.users.set(user.id, user);
@@ -1323,6 +1773,8 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
           user.staffStatus = 'APPROVED';
           user.requestedRole = Role.SUPER_ADMIN;
         }
+        user.version = (user.version ?? 1) + 1;
+        user.updatedAt = new Date().toISOString();
       }
 
       if (isStaffEndpoint && !ADMIN_ROLES.includes(user.role)) {
@@ -1335,6 +1787,12 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         twoFactorVerified: true,
       });
       await kvSyncUser(env, user.id);
+      const prof = edgeState.profiles.get(user.id);
+      await persistEdgeWrites(env, [
+        { collection: 'users', id: user.id, data: user as unknown as Record<string, unknown> },
+        ...(prof ? [{ collection: 'user_profiles', id: user.id, data: prof as unknown as Record<string, unknown> }] : []),
+        { collection: 'sessions', id: session.sessionId, data: session.session as unknown as Record<string, unknown> },
+      ]);
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
 
       return jsonResponse(
@@ -1391,6 +1849,12 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         if (u) {
           if (parsed.data.channel === 'EMAIL') u.emailVerified = true;
           if (parsed.data.channel === 'SMS') u.phoneVerified = true;
+          u.version = (u.version ?? 1) + 1;
+          u.updatedAt = new Date().toISOString();
+          await kvSyncUser(env, u.id);
+          await persistEdgeWrites(env, [
+            { collection: 'users', id: u.id, data: u as unknown as Record<string, unknown> },
+          ]);
         }
       }
       return jsonResponse({ verified: true, userId: otp.userId });
@@ -1402,10 +1866,16 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       if (!refreshJwt) return apiError(401, 'UNAUTHORIZED', 'Missing refresh session', correlationId);
       const claims = await verifyJwtEdge<{ sub: string; sid: string; role: Role; exp?: number }>(refreshJwt, secrets.refreshSecret);
       if (!claims) return apiError(401, 'UNAUTHORIZED', 'Invalid or expired session', correlationId);
+      if (getCloudBackendType(env) !== 'memory') {
+        await syncEdgeFromCloud(env, true);
+      }
       const user = edgeState.users.get(claims.sub);
       if (!user) return apiError(401, 'UNAUTHORIZED', 'Session user unavailable', correlationId);
 
       const session = await createEdgeSession(user, secrets, { twoFactorVerified: true });
+      await persistEdgeWrites(env, [
+        { collection: 'sessions', id: session.sessionId, data: session.session as unknown as Record<string, unknown> },
+      ]);
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
       return jsonResponse(
         {
@@ -1426,13 +1896,47 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     }
 
     // ==================== AUTHENTICATED ENDPOINTS ====================
-    const authCtx = await authenticateEdgeRequest(request, secrets);
+    const authCtx = await authenticateEdgeRequest(request, env, secrets);
     if (!authCtx) {
       return apiError(401, 'UNAUTHORIZED', 'Authentication required', correlationId);
     }
-    const { user, claims } = authCtx;
+    const { user } = authCtx;
+
+    // Cloud Sync & multi-device reconciliation endpoints
+    if ((method === 'GET' || method === 'POST') && path === '/sync') {
+      const force = method === 'POST' || url.searchParams.get('force') === 'true';
+      const synced = await syncEdgeFromCloud(env, force);
+      const invariant = verifyEdgeLedgerInvariant();
+      const isAdmin = ADMIN_ROLES.includes(user.role);
+      const payload: SyncSnapshotResponse = {
+        syncedAt: synced.syncedAt,
+        syncRevision: synced.syncRevision,
+        cloudBackend: synced.cloudBackend,
+        ledgerBalanced: invariant.valid,
+        ...(isAdmin
+          ? {
+              counts: {
+                pendingDeposits: [...edgeState.depositRequests.values()].filter(
+                  (d) => d.status === DepositStatus.PENDING || d.status === DepositStatus.MAKER_APPROVED,
+                ).length,
+                pendingWithdrawals: [...edgeState.withdrawalRequests.values()].filter(
+                  (w) =>
+                    w.status === WithdrawalStatus.PENDING ||
+                    w.status === WithdrawalStatus.MAKER_APPROVED ||
+                    w.status === WithdrawalStatus.CHECKER_APPROVED,
+                ).length,
+                pendingKyc: [...edgeState.users.values()].filter(
+                  (u) => !ADMIN_ROLES.includes(u.role) && (u.kycStatus === KycStatus.PENDING || u.kycStatus === KycStatus.NEEDS_MORE_INFO),
+                ).length,
+              },
+            }
+          : {}),
+      };
+      return jsonResponse(payload);
+    }
 
     if (method === 'GET' && path === '/auth/devices') {
+      await syncEdgeFromCloud(env);
       const devices = [...edgeState.sessions.values()].filter((s) => s.userId === user.id && !s.revokedAt);
       return jsonResponse({ devices });
     }
@@ -1442,6 +1946,11 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       const sess = edgeState.sessions.get(revokeMatch[1]);
       if (sess && sess.userId === user.id) {
         sess.revokedAt = new Date().toISOString();
+        const audit = addAudit(user.id, 'USER', 'SESSION_REVOKED', `session:${sess.id}`);
+        await persistEdgeWrites(env, [
+          { collection: 'sessions', id: sess.id, data: sess as unknown as Record<string, unknown> },
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
       }
       return jsonResponse({ revoked: true });
     }
@@ -1454,7 +1963,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         return apiError(400, 'TRIVIAL_PIN', pinCheck.reason || 'PIN cannot be sequential or repeated digits.', correlationId);
       }
       const { hash, salt } = await hashPinEdge(parsed.data.pin, secrets.pinPepper);
-      edgeState.pins.set(user.id, {
+      const pinRecord: PinRecord = {
         userId: user.id,
         pinHash: hash,
         salt,
@@ -1463,8 +1972,14 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         lockedUntil: null,
         requiresComplianceReview: false,
         updatedAt: new Date().toISOString(),
-      });
+      };
+      edgeState.pins.set(user.id, pinRecord);
+      const audit = addAudit(user.id, ADMIN_ROLES.includes(user.role) ? 'ADMIN' : 'USER', 'PIN_SET', `user:${user.id}`);
       await kvSyncUser(env, user.id);
+      await persistEdgeWrites(env, [
+        { collection: 'pins', id: user.id, data: pinRecord as unknown as Record<string, unknown> },
+        { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+      ]);
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
       return jsonResponse({ pinSet: true }, 200, vaultCookie ? [vaultCookie] : []);
     }
@@ -1480,15 +1995,40 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       const ok = await verifyPinEdge(parsed.data.pin, pinRec.salt, pinRec.pinHash, secrets.pinPepper);
       if (!ok) {
         pinRec.failedAttempts += 1;
+        pinRec.updatedAt = new Date().toISOString();
+        const writes: EdgeCloudWrite[] = [];
         if (pinRec.failedAttempts >= 3) {
           pinRec.lockedUntil = new Date(Date.now() + 30 * 60 * 1000).toISOString();
           pinRec.failedAttempts = 0;
           pinRec.lockoutCount += 1;
+          const flag: RiskFlagRecord = {
+            id: `rsk_${crypto.randomUUID()}`,
+            userId: user.id,
+            rule: 'REPEATED_PIN_FAILURES',
+            severity: pinRec.lockoutCount > 1 ? RiskSeverity.HIGH : RiskSeverity.MEDIUM,
+            details: `PIN locked after repeated failed attempts (lockout #${pinRec.lockoutCount})`,
+            status: 'OPEN',
+            resolvedBy: null,
+            resolutionNote: null,
+            createdAt: pinRec.updatedAt,
+            resolvedAt: null,
+          };
+          edgeState.riskFlags.set(flag.id, flag);
+          writes.push({ collection: 'risk_flags', id: flag.id, data: flag as unknown as Record<string, unknown> });
         }
+        writes.push({ collection: 'pins', id: user.id, data: pinRec as unknown as Record<string, unknown> });
+        await kvSyncUser(env, user.id);
+        await persistEdgeWrites(env, writes);
         return apiError(400, 'INVALID_PIN', 'Incorrect 6-digit PIN.', correlationId);
       }
-      pinRec.failedAttempts = 0;
-      pinRec.lockedUntil = null;
+      if (pinRec.failedAttempts > 0 || pinRec.lockedUntil) {
+        pinRec.failedAttempts = 0;
+        pinRec.lockedUntil = null;
+        pinRec.updatedAt = new Date().toISOString();
+        await persistEdgeWrites(env, [
+          { collection: 'pins', id: user.id, data: pinRec as unknown as Record<string, unknown> },
+        ], false);
+      }
       const ttl = parsed.data.scope === 'view' ? 300 : 120;
       const stepUpToken = await signJwtEdge(
         {
@@ -1522,24 +2062,32 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       pinRec.pinHash = hash;
       pinRec.salt = salt;
       pinRec.updatedAt = new Date().toISOString();
+      const audit = addAudit(user.id, ADMIN_ROLES.includes(user.role) ? 'ADMIN' : 'USER', 'PIN_CHANGED', `user:${user.id}`);
+      await kvSyncUser(env, user.id);
+      await persistEdgeWrites(env, [
+        { collection: 'pins', id: user.id, data: pinRec as unknown as Record<string, unknown> },
+        { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+      ]);
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
       return jsonResponse({ changed: true }, 200, vaultCookie ? [vaultCookie] : []);
     }
 
     if (method === 'GET' && path === '/me') {
-      const prefs: NotificationPreferences = edgeState.notificationPreferences.get(user.id) || {
-        userId: user.id,
+      await syncEdgeFromCloud(env);
+      const latestUser = edgeState.users.get(user.id) || user;
+      const prefs: NotificationPreferences = edgeState.notificationPreferences.get(latestUser.id) || {
+        userId: latestUser.id,
         emailReceipts: true,
         pushTransactions: true,
         smsTransactions: true,
         mandatorySecurityAlerts: true,
       };
       return jsonResponse({
-        user: sanitizeUser(user),
-        profile: edgeState.profiles.get(user.id) ?? null,
-        pinConfigured: edgeState.pins.has(user.id),
+        user: sanitizeUser(latestUser),
+        profile: edgeState.profiles.get(latestUser.id) ?? null,
+        pinConfigured: edgeState.pins.has(latestUser.id),
         notificationPreferences: { ...prefs, pushTransactions: true, mandatorySecurityAlerts: true },
-        permissions: getPermissionSet(user.role),
+        permissions: getPermissionSet(latestUser.role),
       });
     }
 
@@ -1559,6 +2107,10 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       if (address) existing.address = address;
       existing.updatedAt = new Date().toISOString();
       edgeState.profiles.set(user.id, existing);
+      await kvSyncUser(env, user.id);
+      await persistEdgeWrites(env, [
+        { collection: 'user_profiles', id: user.id, data: existing as unknown as Record<string, unknown> },
+      ]);
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
       return jsonResponse({ profile: existing }, 200, vaultCookie ? [vaultCookie] : []);
     }
@@ -1567,7 +2119,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       const parsed = kycSubmitSchema.safeParse(body);
       if (!parsed.success) return apiError(400, 'VALIDATION_ERROR', parsed.error.issues[0].message, correlationId);
       const now = new Date().toISOString();
-      edgeState.profiles.set(user.id, {
+      const profileRec: UserProfileRecord = {
         userId: user.id,
         fullName: parsed.data.fullName,
         dateOfBirth: parsed.data.dateOfBirth,
@@ -1575,9 +2127,10 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         address: parsed.data.address,
         country: parsed.data.country,
         updatedAt: now,
-      });
+      };
+      edgeState.profiles.set(user.id, profileRec);
       const kycId = `kyc_${crypto.randomUUID()}`;
-      edgeState.kycDocs.set(kycId, {
+      const kycDoc: KycDocumentRecord = {
         id: kycId,
         userId: user.id,
         type: parsed.data.documentType,
@@ -1588,19 +2141,32 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         reviewedAt: null,
         rejectionReason: null,
         createdAt: now,
-      });
+      };
+      edgeState.kycDocs.set(kycId, kycDoc);
       user.kycStatus = KycStatus.PENDING;
+      user.version = (user.version ?? 1) + 1;
+      user.updatedAt = now;
+      const audit = addAudit(user.id, 'USER', 'KYC_SUBMITTED', `user:${user.id}`, { kycId });
       await kvSyncUser(env, user.id);
+      await persistEdgeWrites(env, [
+        { collection: 'user_profiles', id: user.id, data: profileRec as unknown as Record<string, unknown> },
+        { collection: 'kyc_documents', id: kycDoc.id, data: kycDoc as unknown as Record<string, unknown> },
+        { collection: 'users', id: user.id, data: user as unknown as Record<string, unknown> },
+        { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+      ]);
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
       return jsonResponse({ kycStatus: user.kycStatus }, 201, vaultCookie ? [vaultCookie] : []);
     }
 
     if (method === 'GET' && path === '/kyc/status') {
+      await syncEdgeFromCloud(env);
+      const latestUser = edgeState.users.get(user.id) || user;
       const docs = [...edgeState.kycDocs.values()].filter((d) => d.userId === user.id);
-      return jsonResponse({ kycStatus: user.kycStatus, kycTier: user.kycTier, documents: docs });
+      return jsonResponse({ kycStatus: latestUser.kycStatus, kycTier: latestUser.kycTier, documents: docs });
     }
 
     if (method === 'GET' && path === '/accounts') {
+      await syncEdgeFromCloud(env);
       const tierScope = user.kycTier >= 2 ? 'TIER_2' : 'TIER_1';
       const accounts = [...edgeState.accounts.values()]
         .filter((a) => a.userId === user.id)
@@ -1624,6 +2190,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     if (method === 'GET' && balMatch) {
       const step = await verifyStepUpEdge(request, user.id, 'view', secrets);
       if (!step) return apiError(403, 'STEPUP_REQUIRED', 'PIN verification required to view balances.', correlationId);
+      await syncEdgeFromCloud(env);
       const acc = edgeState.accounts.get(balMatch[1]);
       if (!acc || acc.userId !== user.id) return apiError(404, 'ACCOUNT_NOT_FOUND', 'Wallet account not found.', correlationId);
       const la = getEdgeWalletLedger(acc.id);
@@ -1640,6 +2207,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
 
     const lookupMatch = path.match(/^\/accounts\/lookup\/([^/]+)$/);
     if (method === 'GET' && lookupMatch) {
+      await syncEdgeFromCloud(env);
       const acc = [...edgeState.accounts.values()].find((a) => a.accountNumber === lookupMatch[1]);
       if (!acc) return apiError(404, 'RECIPIENT_NOT_FOUND', 'Recipient wallet account number not found.', correlationId);
       const prof = edgeState.profiles.get(acc.userId);
@@ -1649,6 +2217,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     }
 
     if (method === 'GET' && path === '/fees/preview') {
+      await syncEdgeFromCloud(env);
       const amountMinor = Number(url.searchParams.get('amountMinor') || '0');
       const currency = (url.searchParams.get('currency') || Currency.USD) as Currency;
       const feeMinor = calculateTransferFee(amountMinor, currency);
@@ -1656,6 +2225,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     }
 
     if (method === 'GET' && path === '/transactions') {
+      await syncEdgeFromCloud(env);
       const accIds = new Set([...edgeState.accounts.values()].filter((a) => a.userId === user.id).map((a) => a.id));
       const transactions = [...edgeState.transactions.values()]
         .filter((t) => (t.fromAccountId && accIds.has(t.fromAccountId)) || (t.toAccountId && accIds.has(t.toAccountId)))
@@ -1665,6 +2235,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
 
     const receiptMatch = path.match(/^\/transactions\/([^/]+)\/receipt$/);
     if (method === 'GET' && receiptMatch) {
+      await syncEdgeFromCloud(env);
       const txn = edgeState.transactions.get(receiptMatch[1]);
       if (!txn) return apiError(404, 'NOT_FOUND', 'Transaction not found.', correlationId);
       const pdf = buildMinimalPdf([
@@ -1687,6 +2258,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     }
 
     if (method === 'GET' && path === '/deposits/requests') {
+      await syncEdgeFromCloud(env);
       const deposits = [...edgeState.depositRequests.values()]
         .filter((d) => d.userId === user.id)
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -1694,14 +2266,40 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     }
 
     if (method === 'POST' && path === '/deposits/requests') {
+      const idemKey = request.headers.get('idempotency-key')?.trim();
+      if (!idemKey) return apiError(400, 'IDEMPOTENCY_KEY_REQUIRED', 'Idempotency-Key header required.', correlationId);
+
       const parsed = depositRequestSchema.safeParse(body);
       if (!parsed.success) return apiError(400, 'VALIDATION_ERROR', parsed.error.issues[0].message, correlationId);
-      const normRef = parsed.data.paymentReference.trim().toLowerCase();
+      const normalizedRef = parsed.data.paymentReference.trim().toLowerCase();
+
+      await syncEdgeFromCloud(env);
+      const idemCheck = await checkIdempotencyEdge(env, 'dep', user.id, idemKey, {
+        accountId: parsed.data.accountId,
+        amountMinor: parsed.data.amountMinor,
+        currency: parsed.data.currency,
+        method: parsed.data.method,
+        paymentReference: normalizedRef,
+      });
+      if (idemCheck.status === 'CONFLICT') {
+        return apiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key already used with different deposit details.', correlationId);
+      }
+      if (idemCheck.status === 'HIT') {
+        return jsonResponse(idemCheck.record.body, idemCheck.record.statusCode);
+      }
+
+      const acc = edgeState.accounts.get(parsed.data.accountId);
+      if (acc && acc.userId !== user.id) {
+        return apiError(403, 'FORBIDDEN', 'Destination wallet belongs to another user.', correlationId);
+      }
+
       for (const d of edgeState.depositRequests.values()) {
-        if (d.paymentReference.toLowerCase() === normRef) {
+        if (d.status !== DepositStatus.REJECTED && d.paymentReference.trim().toLowerCase() === normalizedRef) {
           return apiError(409, 'DUPLICATE_REFERENCE', 'This payment reference has already been submitted.', correlationId);
         }
       }
+
+      const now = new Date().toISOString();
       const dep: DepositRequestRecord = {
         id: `dep_${crypto.randomUUID()}`,
         userId: user.id,
@@ -1716,28 +2314,84 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         checkerId: null,
         decidedAt: null,
         notes: null,
-        createdAt: new Date().toISOString(),
+        version: 1,
+        updatedAt: now,
+        createdAt: now,
       };
       edgeState.depositRequests.set(dep.id, dep);
-      enqueueEdgeNotification({
+
+      const createdNotifs: NotificationRecord[] = [];
+      createdNotifs.push(
+        ...enqueueEdgeNotification({
+          userId: user.id,
+          channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH],
+          template: 'DEPOSIT_SUBMITTED_v1',
+          title: 'Deposit Request Received',
+          body: `Deposit request for ${dep.currency} ${(dep.amountMinor / 100).toFixed(2)} (${dep.paymentReference}) is pending review.`,
+        }),
+      );
+
+      for (const staffUser of edgeState.users.values()) {
+        if (ADMIN_ROLES.includes(staffUser.role) && staffUser.staffStatus === 'APPROVED') {
+          createdNotifs.push(
+            ...enqueueEdgeNotification({
+              userId: staffUser.id,
+              channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH],
+              template: 'ADMIN_DEPOSIT_PENDING_v1',
+              title: 'New Add Money Request',
+              body: `${dep.currency} ${(dep.amountMinor / 100).toFixed(2)} via ${dep.method} (Ref: ${dep.paymentReference}) awaits Maker review.`,
+            }),
+          );
+        }
+      }
+
+      const respBody = { deposit: dep };
+      const idemRec: IdempotencyRecord = {
+        key: idemKey,
+        scope: 'dep',
         userId: user.id,
-        channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH],
-        template: 'DEPOSIT_SUBMITTED_v1',
-        title: 'Deposit Request Received',
-        body: `Deposit request for ${dep.currency} ${(dep.amountMinor / 100).toFixed(2)} (${dep.paymentReference}) is pending review.`,
+        payloadHash: idemCheck.payloadHash,
+        statusCode: 201,
+        body: respBody,
+        createdAt: now,
+      };
+      edgeState.idempotencyResponses.set(idemCheck.cacheKey, idemRec);
+      const audit = addAudit(user.id, 'USER', 'DEPOSIT_REQUEST_SUBMITTED', `deposit:${dep.id}`, {
+        amountMinor: dep.amountMinor,
+        currency: dep.currency,
+        paymentReference: dep.paymentReference,
       });
+
+      await persistEdgeWrites(env, [
+        { collection: 'deposit_requests', id: dep.id, data: dep as unknown as Record<string, unknown> },
+        { collection: 'idempotency_keys', id: idemCheck.cacheKey, data: idemRec as unknown as Record<string, unknown>, mustNotExist: true },
+        { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ...createdNotifs.map((n) => ({
+          collection: 'notifications',
+          id: n.id,
+          data: n as unknown as Record<string, unknown>,
+        })),
+      ]);
+
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
-      return jsonResponse({ deposit: dep }, 201, vaultCookie ? [vaultCookie] : []);
+      return jsonResponse(respBody, 201, vaultCookie ? [vaultCookie] : []);
     }
 
     if (method === 'POST' && path === '/transfers') {
       const idemKey = request.headers.get('idempotency-key')?.trim();
       if (!idemKey) return apiError(400, 'IDEMPOTENCY_KEY_REQUIRED', 'Idempotency-Key header required.', correlationId);
-      const cached = edgeState.idempotencyResponses.get(`${user.id}:${idemKey}`);
-      if (cached) return jsonResponse(cached.body, cached.statusCode);
 
       const parsed = transferSchema.safeParse(body);
       if (!parsed.success) return apiError(400, 'VALIDATION_ERROR', parsed.error.issues[0].message, correlationId);
+
+      await syncEdgeFromCloud(env);
+      const idemCheck = await checkIdempotencyEdge(env, 'trf', user.id, idemKey, parsed.data);
+      if (idemCheck.status === 'CONFLICT') {
+        return apiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key already used with different transfer details.', correlationId);
+      }
+      if (idemCheck.status === 'HIT') {
+        return jsonResponse(idemCheck.record.body, idemCheck.record.statusCode);
+      }
 
       const fromAcc = edgeState.accounts.get(parsed.data.fromAccountId);
       if (!fromAcc || fromAcc.userId !== user.id) return apiError(404, 'ACCOUNT_NOT_FOUND', 'Source wallet not found.', correlationId);
@@ -1760,7 +2414,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       const feeLa = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.FEE_REVENUE}_${fromAcc.currency}`);
       if (!fromLa || !toLa || !feeLa) return apiError(500, 'LEDGER_ERROR', 'Ledger accounts unavailable.', correlationId);
 
-      const txn = postAtomicEdgeTransaction({
+      const posted = postAtomicEdgeTransaction({
         type: TransactionType.TRANSFER,
         amountMinor: parsed.data.amountMinor,
         feeMinor,
@@ -1777,27 +2431,60 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         ],
       });
 
-      enqueueEdgeNotification({
+      const senderNotifs = enqueueEdgeNotification({
         userId: user.id,
         channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH],
         template: 'TRANSFER_SENT_v1',
         title: 'Money Sent',
-        body: `Sent ${txn.currency} ${(txn.amountMinor / 100).toFixed(2)} to ${toAcc.accountNumber}.`,
+        body: `Sent ${posted.txn.currency} ${(posted.txn.amountMinor / 100).toFixed(2)} to ${toAcc.accountNumber}.`,
       });
-      enqueueEdgeNotification({
+      const recipientNotifs = enqueueEdgeNotification({
         userId: toAcc.userId,
         channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH],
         template: 'TRANSFER_RECEIVED_v1',
         title: 'Money Received',
-        body: `Received ${txn.currency} ${(txn.amountMinor / 100).toFixed(2)} from ${fromAcc.accountNumber}.`,
+        body: `Received ${posted.txn.currency} ${(posted.txn.amountMinor / 100).toFixed(2)} from ${fromAcc.accountNumber}.`,
       });
-      const resp = { transaction: txn };
-      edgeState.idempotencyResponses.set(`${user.id}:${idemKey}`, { statusCode: 201, body: resp, userId: user.id });
+
+      const respBody = { transaction: posted.txn };
+      const now = new Date().toISOString();
+      const idemRec: IdempotencyRecord = {
+        key: idemKey,
+        scope: 'trf',
+        userId: user.id,
+        payloadHash: idemCheck.payloadHash,
+        statusCode: 201,
+        body: respBody,
+        createdAt: now,
+      };
+      edgeState.idempotencyResponses.set(idemCheck.cacheKey, idemRec);
+      const audit = addAudit(user.id, 'USER', 'TRANSFER_COMPLETED', `txn:${posted.txn.id}`, {
+        amountMinor: posted.txn.amountMinor,
+        feeMinor: posted.txn.feeMinor,
+        currency: posted.txn.currency,
+        toAccountId: toAcc.id,
+      });
+
+      await persistEdgeWrites(env, [
+        { collection: 'transactions', id: posted.txn.id, data: posted.txn as unknown as Record<string, unknown> },
+        { collection: 'journal_entries', id: posted.je.id, data: posted.je as unknown as Record<string, unknown> },
+        ...posted.jl.map((l) => ({ collection: 'journal_lines', id: l.id, data: l as unknown as Record<string, unknown> })),
+        ...posted.touchedLedgerAccounts.map((la) => ({ collection: 'ledger_accounts', id: la.id, data: la as unknown as Record<string, unknown> })),
+        { collection: 'idempotency_keys', id: idemCheck.cacheKey, data: idemRec as unknown as Record<string, unknown>, mustNotExist: true },
+        { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ...[...senderNotifs, ...recipientNotifs].map((n) => ({
+          collection: 'notifications',
+          id: n.id,
+          data: n as unknown as Record<string, unknown>,
+        })),
+      ]);
+
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
-      return jsonResponse(resp, 201, vaultCookie ? [vaultCookie] : []);
+      return jsonResponse(respBody, 201, vaultCookie ? [vaultCookie] : []);
     }
 
     if (method === 'GET' && path === '/withdrawals/requests') {
+      await syncEdgeFromCloud(env);
       const withdrawals = [...edgeState.withdrawalRequests.values()]
         .filter((w) => w.userId === user.id)
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -1810,6 +2497,16 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
 
       const parsed = withdrawalRequestSchema.safeParse(body);
       if (!parsed.success) return apiError(400, 'VALIDATION_ERROR', parsed.error.issues[0].message, correlationId);
+
+      await syncEdgeFromCloud(env);
+      const idemCheck = await checkIdempotencyEdge(env, 'wdr_req', user.id, idemKey, parsed.data);
+      if (idemCheck.status === 'CONFLICT') {
+        return apiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key already used with different withdrawal details.', correlationId);
+      }
+      if (idemCheck.status === 'HIT') {
+        return jsonResponse(idemCheck.record.body, idemCheck.record.statusCode);
+      }
+
       const acc = edgeState.accounts.get(parsed.data.accountId);
       if (!acc || acc.userId !== user.id) return apiError(404, 'ACCOUNT_NOT_FOUND', 'Wallet account not found.', correlationId);
 
@@ -1829,7 +2526,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       const holdLa = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.WITHDRAWAL_HOLD}_${acc.currency}`);
       if (!fromLa || !holdLa) return apiError(500, 'LEDGER_ERROR', 'Ledger unavailable.', correlationId);
 
-      postAtomicEdgeTransaction({
+      const posted = postAtomicEdgeTransaction({
         type: TransactionType.WITHDRAWAL,
         amountMinor: parsed.data.amountMinor,
         feeMinor: 0,
@@ -1845,6 +2542,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         ],
       });
 
+      const now = new Date().toISOString();
       const wdr: WithdrawalRequestRecord = {
         id: `wdr_${crypto.randomUUID()}`,
         userId: user.id,
@@ -1859,23 +2557,54 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         payoutReference: null,
         decidedAt: null,
         rejectionReason: null,
-        createdAt: new Date().toISOString(),
+        version: 1,
+        updatedAt: now,
+        createdAt: now,
       };
       edgeState.withdrawalRequests.set(wdr.id, wdr);
-      enqueueEdgeNotification({
+      const notifs = enqueueEdgeNotification({
         userId: user.id,
         channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH],
         template: 'WITHDRAWAL_REQUESTED_v1',
         title: 'Withdrawal Hold Placed',
         body: `Withdrawal of ${wdr.currency} ${(wdr.amountMinor / 100).toFixed(2)} placed on hold for processing.`,
       });
+
+      const respBody = { withdrawal: wdr };
+      const idemRec: IdempotencyRecord = {
+        key: idemKey,
+        scope: 'wdr_req',
+        userId: user.id,
+        payloadHash: idemCheck.payloadHash,
+        statusCode: 201,
+        body: respBody,
+        createdAt: now,
+      };
+      edgeState.idempotencyResponses.set(idemCheck.cacheKey, idemRec);
+      const audit = addAudit(user.id, 'USER', 'WITHDRAWAL_REQUESTED', `withdrawal:${wdr.id}`, {
+        amountMinor: wdr.amountMinor,
+        currency: wdr.currency,
+      });
+
+      await persistEdgeWrites(env, [
+        { collection: 'transactions', id: posted.txn.id, data: posted.txn as unknown as Record<string, unknown> },
+        { collection: 'journal_entries', id: posted.je.id, data: posted.je as unknown as Record<string, unknown> },
+        ...posted.jl.map((l) => ({ collection: 'journal_lines', id: l.id, data: l as unknown as Record<string, unknown> })),
+        ...posted.touchedLedgerAccounts.map((la) => ({ collection: 'ledger_accounts', id: la.id, data: la as unknown as Record<string, unknown> })),
+        { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+        { collection: 'idempotency_keys', id: idemCheck.cacheKey, data: idemRec as unknown as Record<string, unknown>, mustNotExist: true },
+        { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ...notifs.map((n) => ({ collection: 'notifications', id: n.id, data: n as unknown as Record<string, unknown> })),
+      ]);
+
       const vaultCookie = await buildVaultCookie(user.id, secrets.encKey, isHttps);
-      return jsonResponse({ withdrawal: wdr }, 201, vaultCookie ? [vaultCookie] : []);
+      return jsonResponse(respBody, 201, vaultCookie ? [vaultCookie] : []);
     }
 
     if (method === 'GET' && path === '/statements') {
       const step = await verifyStepUpEdge(request, user.id, 'view', secrets);
       if (!step) return apiError(403, 'STEPUP_REQUIRED', 'PIN verification required to view statements.', correlationId);
+      await syncEdgeFromCloud(env);
       const accIds = new Set([...edgeState.accounts.values()].filter((a) => a.userId === user.id).map((a) => a.id));
       const txns = [...edgeState.transactions.values()].filter(
         (t) => (t.fromAccountId && accIds.has(t.fromAccountId)) || (t.toAccountId && accIds.has(t.toAccountId)),
@@ -1886,6 +2615,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     if (method === 'POST' && path === '/statements/export') {
       const step = await verifyStepUpEdge(request, user.id, 'view', secrets);
       if (!step) return apiError(403, 'STEPUP_REQUIRED', 'PIN verification required to export statements.', correlationId);
+      await syncEdgeFromCloud(env);
       const format = String(body.format || 'CSV').toUpperCase();
       const accIds = new Set([...edgeState.accounts.values()].filter((a) => a.userId === user.id).map((a) => a.id));
       const txns = [...edgeState.transactions.values()].filter(
@@ -1917,6 +2647,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     }
 
     if (method === 'GET' && path === '/notifications') {
+      await syncEdgeFromCloud(env);
       const notifications = [...edgeState.notifications.values()]
         .filter((n) => n.userId === user.id)
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -1926,7 +2657,12 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
     const readNotifMatch = path.match(/^\/notifications\/([^/]+)\/read$/);
     if (method === 'POST' && readNotifMatch) {
       const n = edgeState.notifications.get(readNotifMatch[1]);
-      if (n && n.userId === user.id && !n.readAt) n.readAt = new Date().toISOString();
+      if (n && n.userId === user.id && !n.readAt) {
+        n.readAt = new Date().toISOString();
+        await persistEdgeWrites(env, [
+          { collection: 'notifications', id: n.id, data: n as unknown as Record<string, unknown> },
+        ], false);
+      }
       return jsonResponse({ ok: true });
     }
 
@@ -1950,6 +2686,9 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         mandatorySecurityAlerts: true,
       };
       edgeState.notificationPreferences.set(user.id, updated);
+      await persistEdgeWrites(env, [
+        { collection: 'notification_preferences', id: user.id, data: updated as unknown as Record<string, unknown> },
+      ], false);
       return jsonResponse({ preferences: updated });
     }
 
@@ -1965,6 +2704,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       const requirePerm = (p: Permission) => perms.includes(p);
 
       if (method === 'GET' && path === '/admin/overview') {
+        await syncEdgeFromCloud(env);
         const balancesByCurrency: Record<
           string,
           { userLiabilitiesMinor: number; withdrawalHoldMinor: number; feeRevenueMinor: number; bankSettlementMinor: number }
@@ -1991,7 +2731,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
           totalUsers: [...edgeState.users.values()].filter((u) => u.role === Role.USER).length,
           totalTransactions: edgeState.transactions.size,
           pendingKyc: [...edgeState.users.values()].filter(
-            (u) => u.kycStatus === KycStatus.PENDING || u.kycStatus === KycStatus.NEEDS_MORE_INFO,
+            (u) => !ADMIN_ROLES.includes(u.role) && (u.kycStatus === KycStatus.PENDING || u.kycStatus === KycStatus.NEEDS_MORE_INFO),
           ).length,
           pendingDeposits: [...edgeState.depositRequests.values()].filter(
             (d) => d.status === DepositStatus.PENDING || d.status === DepositStatus.MAKER_APPROVED,
@@ -2004,13 +2744,15 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
           ).length,
           openRiskFlags: [...edgeState.riskFlags.values()].filter((r) => !r.resolvedAt).length,
           pendingApprovals: [...edgeState.approvals.values()].filter((a) => a.status === 'PENDING').length,
-          ledgerInvariant: { valid: true },
+          syncRevision: edgeState.syncRevision,
+          ledgerInvariant: verifyEdgeLedgerInvariant(),
           balancesByCurrency,
         });
       }
 
       if (method === 'GET' && path === '/admin/kyc') {
         if (!requirePerm('kyc:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing permission kyc:read', correlationId);
+        await syncEdgeFromCloud(env);
         const queue = await Promise.all(
           [...edgeState.users.values()]
             .filter((u) => !ADMIN_ROLES.includes(u.role) && (u.kycStatus === KycStatus.PENDING || u.kycStatus === KycStatus.NEEDS_MORE_INFO))
@@ -2051,20 +2793,66 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         if (!requirePerm('kyc:decide')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing permission kyc:decide', correlationId);
         const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'kyc_decide' });
         if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
+        await syncEdgeFromCloud(env);
         const target = edgeState.users.get(kycDecMatch[1]);
         if (!target) return apiError(404, 'USER_NOT_FOUND', 'User not found.', correlationId);
         const decision = body.decision as KycStatus;
+        if (!['APPROVED', 'REJECTED', 'NEEDS_MORE_INFO'].includes(decision)) {
+          return apiError(400, 'VALIDATION_ERROR', 'Invalid KYC decision.', correlationId);
+        }
+        const now = new Date().toISOString();
         target.kycStatus = decision;
+        let createdAccounts: AccountRecord[] = [];
+        const createdLedgerAccounts: LedgerAccountRecord[] = [];
         if (decision === KycStatus.APPROVED) {
           target.kycTier = 1;
-          provisionWalletsForUser(target.id);
+          createdAccounts = provisionWalletsForUser(target.id);
+          for (const acc of createdAccounts) {
+            const la = getEdgeWalletLedger(acc.id);
+            if (la) createdLedgerAccounts.push(la);
+          }
         }
+        target.version = (target.version ?? 1) + 1;
+        target.updatedAt = now;
+        const updatedDocs: KycDocumentRecord[] = [];
+        for (const doc of edgeState.kycDocs.values()) {
+          if (doc.userId === target.id && doc.status === KycStatus.PENDING) {
+            doc.status = decision;
+            doc.reviewedBy = user.id;
+            doc.reviewedAt = now;
+            doc.rejectionReason = decision !== KycStatus.APPROVED ? String(body.reason || '') : null;
+            updatedDocs.push(doc);
+          }
+        }
+        const notifs = enqueueEdgeNotification({
+          userId: target.id,
+          channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH, NotificationChannel.EMAIL],
+          template: decision === KycStatus.APPROVED ? 'KYC_APPROVED_v1' : 'KYC_REVIEW_UPDATE_v1',
+          title: decision === KycStatus.APPROVED ? 'KYC Verified & Wallets Ready' : 'KYC Review Update',
+          body:
+            decision === KycStatus.APPROVED
+              ? 'Your identity is verified and your USD/ZWG wallets are now active.'
+              : `KYC status updated to ${decision}${body.reason ? `: ${String(body.reason)}` : ''}.`,
+        });
+        const audit = addAudit(user.id, 'ADMIN', `KYC_${decision}`, `user:${target.id}`, {
+          decision,
+          reason: body.reason || null,
+        });
         await kvSyncUser(env, target.id);
-        return jsonResponse({ user: sanitizeUser(target) });
+        await persistEdgeWrites(env, [
+          { collection: 'users', id: target.id, data: target as unknown as Record<string, unknown> },
+          ...updatedDocs.map((d) => ({ collection: 'kyc_documents', id: d.id, data: d as unknown as Record<string, unknown> })),
+          ...createdAccounts.map((a) => ({ collection: 'accounts', id: a.id, data: a as unknown as Record<string, unknown> })),
+          ...createdLedgerAccounts.map((la) => ({ collection: 'ledger_accounts', id: la.id, data: la as unknown as Record<string, unknown> })),
+          ...notifs.map((n) => ({ collection: 'notifications', id: n.id, data: n as unknown as Record<string, unknown> })),
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ user: sanitizeUser(target), accounts: createdAccounts });
       }
 
       if (method === 'GET' && path === '/admin/deposits') {
         if (!requirePerm('deposits:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing permission deposits:read', correlationId);
+        await syncEdgeFromCloud(env);
         const deposits = [...edgeState.depositRequests.values()]
           .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
           .map((d) => {
@@ -2081,44 +2869,197 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
 
       const depApproveMatch = path.match(/^\/admin\/deposits\/([^/]+)\/approve$/);
       if (method === 'POST' && depApproveMatch) {
-        const dep = edgeState.depositRequests.get(depApproveMatch[1]);
+        const depositId = depApproveMatch[1];
+        const idemKey = request.headers.get('idempotency-key')?.trim() || null;
+        const expectedStatus = typeof body.expectedStatus === 'string' ? (body.expectedStatus as DepositStatus) : undefined;
+        await syncEdgeFromCloud(env);
+
+        let idemCacheKey: string | null = null;
+        let idemPayloadHash = '';
+        if (idemKey) {
+          const idemCheck = await checkIdempotencyEdge(env, 'adm_dep_app', user.id, idemKey, {
+            depositId,
+            expectedStatus: expectedStatus ?? null,
+          });
+          if (idemCheck.status === 'CONFLICT') {
+            return apiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key conflict on deposit approval.', correlationId);
+          }
+          if (idemCheck.status === 'HIT') {
+            return jsonResponse(idemCheck.record.body, idemCheck.record.statusCode);
+          }
+          idemCacheKey = idemCheck.cacheKey;
+          idemPayloadHash = idemCheck.payloadHash;
+        }
+
+        const dep = edgeState.depositRequests.get(depositId);
         if (!dep) return apiError(404, 'NOT_FOUND', 'Deposit request not found.', correlationId);
+        if (expectedStatus && dep.status !== expectedStatus) {
+          return apiError(409, 'STATE_CONFLICT', `Deposit is already ${dep.status}. Sync and review latest state.`, correlationId);
+        }
+
+        const now = new Date().toISOString();
+        const writes: EdgeCloudWrite[] = [];
         if (dep.status === DepositStatus.PENDING) {
           if (!requirePerm('deposits:make')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing deposits:make', correlationId);
+          const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'deposit_approve' });
+          if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
           dep.status = DepositStatus.MAKER_APPROVED;
           dep.makerId = user.id;
+          dep.notes = typeof body.notes === 'string' && body.notes.trim() ? body.notes.trim() : dep.notes;
+          dep.version = (dep.version ?? 1) + 1;
+          dep.updatedAt = now;
+          const audit = addAudit(user.id, 'ADMIN', 'DEPOSIT_MAKER_APPROVED', `deposit:${dep.id}`);
+          writes.push(
+            { collection: 'deposit_requests', id: dep.id, data: dep as unknown as Record<string, unknown> },
+            { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+          );
         } else if (dep.status === DepositStatus.MAKER_APPROVED) {
           if (!requirePerm('deposits:check')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing deposits:check', correlationId);
+          const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'deposit_approve' });
+          if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
           if (dep.makerId === user.id) return apiError(403, 'MAKER_CHECKER_VIOLATION', 'Checker must differ from Maker.', correlationId);
+
           const acc = edgeState.accounts.get(dep.accountId);
           const la = acc ? getEdgeWalletLedger(acc.id) : undefined;
           const bankLa = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.BANK_SETTLEMENT}_${dep.currency}`);
-          if (la && bankLa) {
-            postAtomicEdgeTransaction({
-              type: TransactionType.DEPOSIT,
-              amountMinor: dep.amountMinor,
-              feeMinor: 0,
-              currency: dep.currency,
-              fromAccountId: null,
-              toAccountId: dep.accountId,
-              reference: dep.paymentReference,
-              idempotencyKey: `dep_chk_${dep.id}`,
-              description: `Deposit credited (${dep.method})`,
-              legs: [
-                { ledgerAccountId: bankLa.id, direction: JournalDirection.DEBIT, amountMinor: dep.amountMinor, currency: dep.currency },
-                { ledgerAccountId: la.id, direction: JournalDirection.CREDIT, amountMinor: dep.amountMinor, currency: dep.currency },
-              ],
-            });
-          }
+          if (!la || !bankLa) return apiError(400, 'WALLET_REQUIRED', 'Customer wallet ledger not provisioned yet.', correlationId);
+
+          const posted = postAtomicEdgeTransaction({
+            type: TransactionType.DEPOSIT,
+            amountMinor: dep.amountMinor,
+            feeMinor: 0,
+            currency: dep.currency,
+            fromAccountId: null,
+            toAccountId: dep.accountId,
+            reference: dep.paymentReference,
+            idempotencyKey: `dep_chk_${dep.id}`,
+            description: `Deposit credited (${dep.method})`,
+            legs: [
+              { ledgerAccountId: bankLa.id, direction: JournalDirection.DEBIT, amountMinor: dep.amountMinor, currency: dep.currency },
+              { ledgerAccountId: la.id, direction: JournalDirection.CREDIT, amountMinor: dep.amountMinor, currency: dep.currency },
+            ],
+          });
           dep.status = DepositStatus.APPROVED;
           dep.checkerId = user.id;
-          dep.decidedAt = new Date().toISOString();
+          dep.decidedAt = now;
+          dep.notes = typeof body.notes === 'string' && body.notes.trim() ? body.notes.trim() : dep.notes;
+          dep.version = (dep.version ?? 1) + 1;
+          dep.updatedAt = now;
+
+          const notifs = enqueueEdgeNotification({
+            userId: dep.userId,
+            channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH, NotificationChannel.EMAIL],
+            template: 'DEPOSIT_CREDITED_v1',
+            title: 'Wallet Credited',
+            body: `${dep.currency} ${(dep.amountMinor / 100).toFixed(2)} has been credited to your wallet (Ref: ${dep.paymentReference}).`,
+          });
+          const audit = addAudit(user.id, 'ADMIN', 'DEPOSIT_CHECKER_POSTED', `deposit:${dep.id}`, {
+            transactionId: posted.txn.id,
+          });
+          writes.push(
+            { collection: 'transactions', id: posted.txn.id, data: posted.txn as unknown as Record<string, unknown> },
+            { collection: 'journal_entries', id: posted.je.id, data: posted.je as unknown as Record<string, unknown> },
+            ...posted.jl.map((l) => ({ collection: 'journal_lines', id: l.id, data: l as unknown as Record<string, unknown> })),
+            ...posted.touchedLedgerAccounts.map((l) => ({ collection: 'ledger_accounts', id: l.id, data: l as unknown as Record<string, unknown> })),
+            { collection: 'deposit_requests', id: dep.id, data: dep as unknown as Record<string, unknown> },
+            ...notifs.map((n) => ({ collection: 'notifications', id: n.id, data: n as unknown as Record<string, unknown> })),
+            { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+          );
+        } else {
+          return apiError(409, 'STATE_CONFLICT', `Deposit cannot be approved from status ${dep.status}.`, correlationId);
         }
-        return jsonResponse({ deposit: dep });
+
+        const respBody = { deposit: dep };
+        if (idemKey && idemCacheKey) {
+          const idemRec: IdempotencyRecord = {
+            key: idemKey,
+            scope: 'adm_dep_app',
+            userId: user.id,
+            payloadHash: idemPayloadHash,
+            statusCode: 200,
+            body: respBody,
+            createdAt: now,
+          };
+          edgeState.idempotencyResponses.set(idemCacheKey, idemRec);
+          writes.push({ collection: 'idempotency_keys', id: idemCacheKey, data: idemRec as unknown as Record<string, unknown>, mustNotExist: true });
+        }
+        await persistEdgeWrites(env, writes);
+        return jsonResponse(respBody);
+      }
+
+      const depRejectMatch = path.match(/^\/admin\/deposits\/([^/]+)\/reject$/);
+      if (method === 'POST' && depRejectMatch) {
+        if (!requirePerm('deposits:make')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing deposits:make', correlationId);
+        const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'deposit_reject' });
+        if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
+
+        const depositId = depRejectMatch[1];
+        const reason = String(body.reason || '').trim();
+        if (reason.length < 3) return apiError(400, 'VALIDATION_ERROR', 'Rejection reason must be at least 3 characters.', correlationId);
+        const expectedStatus = typeof body.expectedStatus === 'string' ? (body.expectedStatus as DepositStatus) : undefined;
+        await syncEdgeFromCloud(env);
+
+        const idemKey = request.headers.get('idempotency-key')?.trim() || null;
+        let idemCacheKey: string | null = null;
+        let idemPayloadHash = '';
+        if (idemKey) {
+          const chk = await checkIdempotencyEdge(env, 'adm_dep_rej', user.id, idemKey, { depositId, reason });
+          if (chk.status === 'CONFLICT') return apiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key conflict.', correlationId);
+          if (chk.status === 'HIT') return jsonResponse(chk.record.body, chk.record.statusCode);
+          idemCacheKey = chk.cacheKey;
+          idemPayloadHash = chk.payloadHash;
+        }
+
+        const dep = edgeState.depositRequests.get(depositId);
+        if (!dep) return apiError(404, 'NOT_FOUND', 'Deposit request not found.', correlationId);
+        if (expectedStatus && dep.status !== expectedStatus) {
+          return apiError(409, 'STATE_CONFLICT', `Deposit is already ${dep.status}. Sync and review latest state.`, correlationId);
+        }
+        if (dep.status !== DepositStatus.PENDING && dep.status !== DepositStatus.MAKER_APPROVED) {
+          return apiError(409, 'STATE_CONFLICT', 'Deposit already finalized.', correlationId);
+        }
+
+        const now = new Date().toISOString();
+        dep.status = DepositStatus.REJECTED;
+        dep.checkerId = user.id;
+        dep.decidedAt = now;
+        dep.notes = reason;
+        dep.version = (dep.version ?? 1) + 1;
+        dep.updatedAt = now;
+        const notifs = enqueueEdgeNotification({
+          userId: dep.userId,
+          channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH, NotificationChannel.EMAIL],
+          template: 'DEPOSIT_REJECTED_v1',
+          title: 'Deposit Request Rejected',
+          body: `Deposit request (${dep.paymentReference}) was rejected: ${reason}.`,
+        });
+        const audit = addAudit(user.id, 'ADMIN', 'DEPOSIT_REJECTED', `deposit:${dep.id}`, { reason });
+        const respBody = { deposit: dep };
+        const writes: EdgeCloudWrite[] = [
+          { collection: 'deposit_requests', id: dep.id, data: dep as unknown as Record<string, unknown> },
+          ...notifs.map((n) => ({ collection: 'notifications', id: n.id, data: n as unknown as Record<string, unknown> })),
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ];
+        if (idemKey && idemCacheKey) {
+          const idemRec: IdempotencyRecord = {
+            key: idemKey,
+            scope: 'adm_dep_rej',
+            userId: user.id,
+            payloadHash: idemPayloadHash,
+            statusCode: 200,
+            body: respBody,
+            createdAt: now,
+          };
+          edgeState.idempotencyResponses.set(idemCacheKey, idemRec);
+          writes.push({ collection: 'idempotency_keys', id: idemCacheKey, data: idemRec as unknown as Record<string, unknown>, mustNotExist: true });
+        }
+        await persistEdgeWrites(env, writes);
+        return jsonResponse(respBody);
       }
 
       if (method === 'GET' && path === '/admin/withdrawals') {
         if (!requirePerm('withdrawals:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing permission withdrawals:read', correlationId);
+        await syncEdgeFromCloud(env);
         const withdrawals = [...edgeState.withdrawalRequests.values()]
           .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
           .map((w) => {
@@ -2134,10 +3075,289 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         return jsonResponse({ withdrawals });
       }
 
+      const wdrApproveMatch = path.match(/^\/admin\/withdrawals\/([^/]+)\/approve$/);
+      if (method === 'POST' && wdrApproveMatch) {
+        const withdrawalId = wdrApproveMatch[1];
+        const expectedStatus = typeof body.expectedStatus === 'string' ? (body.expectedStatus as WithdrawalStatus) : undefined;
+        await syncEdgeFromCloud(env);
+
+        const idemKey = request.headers.get('idempotency-key')?.trim() || null;
+        let idemCacheKey: string | null = null;
+        let idemPayloadHash = '';
+        if (idemKey) {
+          const chk = await checkIdempotencyEdge(env, 'adm_wdr_app', user.id, idemKey, {
+            withdrawalId,
+            expectedStatus: expectedStatus ?? null,
+          });
+          if (chk.status === 'CONFLICT') return apiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key conflict.', correlationId);
+          if (chk.status === 'HIT') return jsonResponse(chk.record.body, chk.record.statusCode);
+          idemCacheKey = chk.cacheKey;
+          idemPayloadHash = chk.payloadHash;
+        }
+
+        const wdr = edgeState.withdrawalRequests.get(withdrawalId);
+        if (!wdr) return apiError(404, 'NOT_FOUND', 'Withdrawal not found.', correlationId);
+        if (expectedStatus && wdr.status !== expectedStatus) {
+          return apiError(409, 'STATE_CONFLICT', `Withdrawal is already ${wdr.status}. Sync and review latest state.`, correlationId);
+        }
+
+        const now = new Date().toISOString();
+        const writes: EdgeCloudWrite[] = [];
+        if (wdr.status === WithdrawalStatus.PENDING) {
+          if (!requirePerm('withdrawals:make')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing withdrawals:make', correlationId);
+          const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'withdrawal_approve' });
+          if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
+          wdr.status = WithdrawalStatus.MAKER_APPROVED;
+          wdr.makerId = user.id;
+          wdr.version = (wdr.version ?? 1) + 1;
+          wdr.updatedAt = now;
+          const audit = addAudit(user.id, 'ADMIN', 'WITHDRAWAL_MAKER_APPROVED', `withdrawal:${wdr.id}`);
+          writes.push(
+            { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+            { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+          );
+        } else if (wdr.status === WithdrawalStatus.MAKER_APPROVED) {
+          if (!requirePerm('withdrawals:check')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing withdrawals:check', correlationId);
+          const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'withdrawal_approve' });
+          if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
+          if (wdr.makerId === user.id) return apiError(403, 'MAKER_CHECKER_VIOLATION', 'Checker must differ from Maker.', correlationId);
+          wdr.status = WithdrawalStatus.CHECKER_APPROVED;
+          wdr.checkerId = user.id;
+          wdr.version = (wdr.version ?? 1) + 1;
+          wdr.updatedAt = now;
+          const audit = addAudit(user.id, 'ADMIN', 'WITHDRAWAL_CHECKER_APPROVED', `withdrawal:${wdr.id}`);
+          writes.push(
+            { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+            { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+          );
+        } else {
+          return apiError(409, 'STATE_CONFLICT', `Withdrawal cannot be approved from status ${wdr.status}.`, correlationId);
+        }
+
+        const respBody = { withdrawal: wdr };
+        if (idemKey && idemCacheKey) {
+          const idemRec: IdempotencyRecord = {
+            key: idemKey,
+            scope: 'adm_wdr_app',
+            userId: user.id,
+            payloadHash: idemPayloadHash,
+            statusCode: 200,
+            body: respBody,
+            createdAt: now,
+          };
+          edgeState.idempotencyResponses.set(idemCacheKey, idemRec);
+          writes.push({ collection: 'idempotency_keys', id: idemCacheKey, data: idemRec as unknown as Record<string, unknown>, mustNotExist: true });
+        }
+        await persistEdgeWrites(env, writes);
+        return jsonResponse(respBody);
+      }
+
+      const wdrPaidMatch = path.match(/^\/admin\/withdrawals\/([^/]+)\/mark-paid$/);
+      if (method === 'POST' && wdrPaidMatch) {
+        if (!requirePerm('withdrawals:payout')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing withdrawals:payout', correlationId);
+        const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'withdrawal_payout' });
+        if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
+
+        const withdrawalId = wdrPaidMatch[1];
+        const payoutReference = String(body.payoutReference || '').trim();
+        if (payoutReference.length < 4) return apiError(400, 'VALIDATION_ERROR', 'Payout reference is required (min 4 chars).', correlationId);
+        const expectedStatus = typeof body.expectedStatus === 'string' ? (body.expectedStatus as WithdrawalStatus) : undefined;
+        await syncEdgeFromCloud(env);
+
+        const idemKey = request.headers.get('idempotency-key')?.trim() || null;
+        let idemCacheKey: string | null = null;
+        let idemPayloadHash = '';
+        if (idemKey) {
+          const chk = await checkIdempotencyEdge(env, 'adm_wdr_paid', user.id, idemKey, { withdrawalId, payoutReference });
+          if (chk.status === 'CONFLICT') return apiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key conflict.', correlationId);
+          if (chk.status === 'HIT') return jsonResponse(chk.record.body, chk.record.statusCode);
+          idemCacheKey = chk.cacheKey;
+          idemPayloadHash = chk.payloadHash;
+        }
+
+        const wdr = edgeState.withdrawalRequests.get(withdrawalId);
+        if (!wdr) return apiError(404, 'NOT_FOUND', 'Withdrawal not found.', correlationId);
+        if (expectedStatus && wdr.status !== expectedStatus) {
+          return apiError(409, 'STATE_CONFLICT', `Withdrawal is already ${wdr.status}.`, correlationId);
+        }
+        if (wdr.status !== WithdrawalStatus.CHECKER_APPROVED) {
+          return apiError(409, 'STATE_CONFLICT', 'Withdrawal must be checker-approved before payout.', correlationId);
+        }
+
+        const holdLa = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.WITHDRAWAL_HOLD}_${wdr.currency}`);
+        const bankLa = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.BANK_SETTLEMENT}_${wdr.currency}`);
+        if (!holdLa || !bankLa) return apiError(500, 'LEDGER_ERROR', 'System ledger accounts unavailable.', correlationId);
+
+        const posted = postAtomicEdgeTransaction({
+          type: TransactionType.WITHDRAWAL,
+          amountMinor: wdr.amountMinor,
+          feeMinor: 0,
+          currency: wdr.currency,
+          fromAccountId: wdr.accountId,
+          toAccountId: null,
+          reference: payoutReference,
+          idempotencyKey: `wdr_paid_${wdr.id}`,
+          description: `External withdrawal payout (${payoutReference})`,
+          legs: [
+            { ledgerAccountId: holdLa.id, direction: JournalDirection.DEBIT, amountMinor: wdr.amountMinor, currency: wdr.currency },
+            { ledgerAccountId: bankLa.id, direction: JournalDirection.CREDIT, amountMinor: wdr.amountMinor, currency: wdr.currency },
+          ],
+          metadata: { withdrawalId: wdr.id, payoutReference },
+        });
+
+        const now = new Date().toISOString();
+        wdr.status = WithdrawalStatus.PAID;
+        wdr.payoutReference = payoutReference;
+        wdr.decidedAt = now;
+        wdr.version = (wdr.version ?? 1) + 1;
+        wdr.updatedAt = now;
+
+        const notifs = enqueueEdgeNotification({
+          userId: wdr.userId,
+          channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH, NotificationChannel.SMS],
+          template: 'WITHDRAWAL_PAID_v1',
+          title: 'Withdrawal Paid',
+          body: `Your withdrawal of ${wdr.currency} ${(wdr.amountMinor / 100).toFixed(2)} has been paid. Ref: ${payoutReference}.`,
+        });
+        const audit = addAudit(user.id, 'ADMIN', 'WITHDRAWAL_PAID', `withdrawal:${wdr.id}`, { payoutReference });
+        const respBody = { withdrawal: wdr };
+        const writes: EdgeCloudWrite[] = [
+          { collection: 'transactions', id: posted.txn.id, data: posted.txn as unknown as Record<string, unknown> },
+          { collection: 'journal_entries', id: posted.je.id, data: posted.je as unknown as Record<string, unknown> },
+          ...posted.jl.map((l) => ({ collection: 'journal_lines', id: l.id, data: l as unknown as Record<string, unknown> })),
+          ...posted.touchedLedgerAccounts.map((l) => ({ collection: 'ledger_accounts', id: l.id, data: l as unknown as Record<string, unknown> })),
+          { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+          ...notifs.map((n) => ({ collection: 'notifications', id: n.id, data: n as unknown as Record<string, unknown> })),
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ];
+        if (idemKey && idemCacheKey) {
+          const idemRec: IdempotencyRecord = {
+            key: idemKey,
+            scope: 'adm_wdr_paid',
+            userId: user.id,
+            payloadHash: idemPayloadHash,
+            statusCode: 200,
+            body: respBody,
+            createdAt: now,
+          };
+          edgeState.idempotencyResponses.set(idemCacheKey, idemRec);
+          writes.push({ collection: 'idempotency_keys', id: idemCacheKey, data: idemRec as unknown as Record<string, unknown>, mustNotExist: true });
+        }
+        await persistEdgeWrites(env, writes);
+        return jsonResponse(respBody);
+      }
+
+      const wdrRejectMatch = path.match(/^\/admin\/withdrawals\/([^/]+)\/reject$/);
+      if (method === 'POST' && wdrRejectMatch) {
+        if (!requirePerm('withdrawals:make')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing withdrawals:make', correlationId);
+        const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'withdrawal_reject' });
+        if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
+
+        const withdrawalId = wdrRejectMatch[1];
+        const reason = String(body.reason || '').trim();
+        if (reason.length < 3) return apiError(400, 'VALIDATION_ERROR', 'Rejection reason must be at least 3 characters.', correlationId);
+        const expectedStatus = typeof body.expectedStatus === 'string' ? (body.expectedStatus as WithdrawalStatus) : undefined;
+        await syncEdgeFromCloud(env);
+
+        const idemKey = request.headers.get('idempotency-key')?.trim() || null;
+        let idemCacheKey: string | null = null;
+        let idemPayloadHash = '';
+        if (idemKey) {
+          const chk = await checkIdempotencyEdge(env, 'adm_wdr_rej', user.id, idemKey, { withdrawalId, reason });
+          if (chk.status === 'CONFLICT') return apiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key conflict.', correlationId);
+          if (chk.status === 'HIT') return jsonResponse(chk.record.body, chk.record.statusCode);
+          idemCacheKey = chk.cacheKey;
+          idemPayloadHash = chk.payloadHash;
+        }
+
+        const wdr = edgeState.withdrawalRequests.get(withdrawalId);
+        if (!wdr) return apiError(404, 'NOT_FOUND', 'Withdrawal not found.', correlationId);
+        if (expectedStatus && wdr.status !== expectedStatus) {
+          return apiError(409, 'STATE_CONFLICT', `Withdrawal is already ${wdr.status}.`, correlationId);
+        }
+        if (wdr.status === WithdrawalStatus.PAID || wdr.status === WithdrawalStatus.REJECTED) {
+          return apiError(409, 'STATE_CONFLICT', 'Withdrawal already finalized.', correlationId);
+        }
+
+        const holdLa = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.WITHDRAWAL_HOLD}_${wdr.currency}`);
+        const userLa = getEdgeWalletLedger(wdr.accountId);
+        if (!holdLa || !userLa) return apiError(500, 'LEDGER_ERROR', 'Ledger accounts unavailable.', correlationId);
+
+        const posted = postAtomicEdgeTransaction({
+          type: TransactionType.REVERSAL,
+          amountMinor: wdr.amountMinor,
+          feeMinor: 0,
+          currency: wdr.currency,
+          fromAccountId: null,
+          toAccountId: wdr.accountId,
+          reference: `WDR-REL-${wdr.id.slice(-6)}`,
+          idempotencyKey: `wdr_rej_${wdr.id}`,
+          description: `Withdrawal rejected - funds released: ${reason}`,
+          legs: [
+            { ledgerAccountId: holdLa.id, direction: JournalDirection.DEBIT, amountMinor: wdr.amountMinor, currency: wdr.currency },
+            { ledgerAccountId: userLa.id, direction: JournalDirection.CREDIT, amountMinor: wdr.amountMinor, currency: wdr.currency },
+          ],
+          metadata: { withdrawalId: wdr.id, reason },
+        });
+
+        const now = new Date().toISOString();
+        wdr.status = WithdrawalStatus.REJECTED;
+        wdr.rejectionReason = reason;
+        wdr.decidedAt = now;
+        wdr.version = (wdr.version ?? 1) + 1;
+        wdr.updatedAt = now;
+
+        const notifs = enqueueEdgeNotification({
+          userId: wdr.userId,
+          channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH],
+          template: 'WITHDRAWAL_REJECTED_v1',
+          title: 'Withdrawal Rejected & Funds Released',
+          body: `Your withdrawal of ${wdr.currency} ${(wdr.amountMinor / 100).toFixed(2)} was rejected (${reason}). Funds returned to wallet.`,
+        });
+        const audit = addAudit(user.id, 'ADMIN', 'WITHDRAWAL_REJECTED', `withdrawal:${wdr.id}`, { reason });
+        const respBody = { withdrawal: wdr };
+        const writes: EdgeCloudWrite[] = [
+          { collection: 'transactions', id: posted.txn.id, data: posted.txn as unknown as Record<string, unknown> },
+          { collection: 'journal_entries', id: posted.je.id, data: posted.je as unknown as Record<string, unknown> },
+          ...posted.jl.map((l) => ({ collection: 'journal_lines', id: l.id, data: l as unknown as Record<string, unknown> })),
+          ...posted.touchedLedgerAccounts.map((l) => ({ collection: 'ledger_accounts', id: l.id, data: l as unknown as Record<string, unknown> })),
+          { collection: 'withdrawal_requests', id: wdr.id, data: wdr as unknown as Record<string, unknown> },
+          ...notifs.map((n) => ({ collection: 'notifications', id: n.id, data: n as unknown as Record<string, unknown> })),
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ];
+        if (idemKey && idemCacheKey) {
+          const idemRec: IdempotencyRecord = {
+            key: idemKey,
+            scope: 'adm_wdr_rej',
+            userId: user.id,
+            payloadHash: idemPayloadHash,
+            statusCode: 200,
+            body: respBody,
+            createdAt: now,
+          };
+          edgeState.idempotencyResponses.set(idemCacheKey, idemRec);
+          writes.push({ collection: 'idempotency_keys', id: idemCacheKey, data: idemRec as unknown as Record<string, unknown>, mustNotExist: true });
+        }
+        await persistEdgeWrites(env, writes);
+        return jsonResponse(respBody);
+      }
+
       if (method === 'GET' && path === '/admin/users') {
         if (!requirePerm('users:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing users:read', correlationId);
+        await syncEdgeFromCloud(env);
+        const q = (url.searchParams.get('q') || '').trim().toLowerCase();
         const users = [...edgeState.users.values()]
           .filter((u) => !ADMIN_ROLES.includes(u.role))
+          .filter((u) => {
+            if (!q) return true;
+            const prof = edgeState.profiles.get(u.id);
+            return (
+              u.email?.toLowerCase().includes(q) ||
+              u.phone?.toLowerCase().includes(q) ||
+              prof?.fullName.toLowerCase().includes(q) ||
+              u.id.toLowerCase().includes(q)
+            );
+          })
           .map((u) => {
             const prof = edgeState.profiles.get(u.id);
             const accounts = [...edgeState.accounts.values()]
@@ -2146,57 +3366,230 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
                 ...a,
                 balanceMinor: getEdgeWalletLedger(a.id)?.cachedBalanceMinor ?? 0,
               }));
+            const notes = [...edgeState.supportNotes.values()].filter((n) => n.userId === u.id);
             return {
               ...sanitizeUser(u),
               fullName: prof?.fullName || null,
               country: prof?.country || null,
               accounts,
-              notes: [],
+              notes,
             };
           });
         return jsonResponse({ users });
       }
 
+      const freezeMatch = path.match(/^\/admin\/users\/([^/]+)\/(freeze|unfreeze)$/);
+      if (method === 'POST' && freezeMatch) {
+        if (!requirePerm('users:freeze')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing users:freeze', correlationId);
+        const freeze = freezeMatch[2] === 'freeze';
+        const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, {
+          adminAction: freeze ? 'user_freeze' : 'user_unfreeze',
+        });
+        if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
+        const reason = String(body.reason || '').trim();
+        if (reason.length < 3) return apiError(400, 'VALIDATION_ERROR', 'A reason is required.', correlationId);
+
+        await syncEdgeFromCloud(env);
+        const target = edgeState.users.get(freezeMatch[1]);
+        if (!target) return apiError(404, 'USER_NOT_FOUND', 'User not found.', correlationId);
+
+        const now = new Date().toISOString();
+        target.status = freeze ? UserStatus.FROZEN : UserStatus.ACTIVE;
+        target.freezeReason = freeze ? reason : null;
+        target.version = (target.version ?? 1) + 1;
+        target.updatedAt = now;
+        const notifs = enqueueEdgeNotification({
+          userId: target.id,
+          channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH, NotificationChannel.EMAIL, NotificationChannel.SMS],
+          template: freeze ? 'ACCOUNT_FROZEN_v1' : 'ACCOUNT_UNFROZEN_v1',
+          title: freeze ? 'Security Alert: Wallet Frozen' : 'Wallet Restored',
+          body: freeze ? `Your wallet has been frozen: ${reason}` : `Your wallet access has been restored: ${reason}`,
+        });
+        const audit = addAudit(user.id, 'ADMIN', freeze ? 'USER_FROZEN' : 'USER_UNFROZEN', `user:${target.id}`, { reason });
+        await kvSyncUser(env, target.id);
+        await persistEdgeWrites(env, [
+          { collection: 'users', id: target.id, data: target as unknown as Record<string, unknown> },
+          ...notifs.map((n) => ({ collection: 'notifications', id: n.id, data: n as unknown as Record<string, unknown> })),
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ user: sanitizeUser(target) });
+      }
+
+      const noteMatch = path.match(/^\/admin\/users\/([^/]+)\/notes$/);
+      if (method === 'POST' && noteMatch) {
+        if (!requirePerm('users:note')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing users:note', correlationId);
+        const noteText = String(body.note || '').trim();
+        if (!noteText) return apiError(400, 'VALIDATION_ERROR', 'Note cannot be empty.', correlationId);
+        const note: SupportNoteRecord = {
+          id: `note_${crypto.randomUUID()}`,
+          userId: noteMatch[1],
+          authorId: user.id,
+          note: noteText,
+          createdAt: new Date().toISOString(),
+        };
+        edgeState.supportNotes.set(note.id, note);
+        const audit = addAudit(user.id, 'ADMIN', 'SUPPORT_NOTE_ADDED', `user:${noteMatch[1]}`);
+        await persistEdgeWrites(env, [
+          { collection: 'support_notes', id: note.id, data: note as unknown as Record<string, unknown> },
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ note }, 201);
+      }
+
       if (method === 'GET' && path === '/admin/transactions') {
         if (!requirePerm('transactions:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing transactions:read', correlationId);
-        return jsonResponse({ transactions: [...edgeState.transactions.values()] });
+        await syncEdgeFromCloud(env);
+        const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+        const transactions = [...edgeState.transactions.values()]
+          .filter((t) => !q || t.reference.toLowerCase().includes(q) || t.id.toLowerCase().includes(q))
+          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+          .map((t) => {
+            const entry = edgeState.journalEntries.find((e) => e.transactionId === t.id);
+            const lines = entry ? edgeState.journalLines.filter((l) => l.entryId === entry.id) : [];
+            return { ...t, journalEntry: entry, journalLines: lines };
+          });
+        return jsonResponse({ transactions });
+      }
+
+      const txnRevMatch = path.match(/^\/admin\/transactions\/([^/]+)\/reverse$/);
+      if (method === 'POST' && txnRevMatch) {
+        if (!requirePerm('transactions:reverse')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing transactions:reverse', correlationId);
+        const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'transaction_reverse' });
+        if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
+
+        const txnId = txnRevMatch[1];
+        const reason = String(body.reason || 'Administrative reversal').trim();
+        await syncEdgeFromCloud(env);
+
+        const idemKey = request.headers.get('idempotency-key')?.trim() || `rev_${txnId}`;
+        const idemCheck = await checkIdempotencyEdge(env, 'adm_txn_rev', user.id, idemKey, { txnId, reason });
+        if (idemCheck.status === 'CONFLICT') {
+          return apiError(409, 'IDEMPOTENCY_CONFLICT', 'Idempotency-Key conflict on reversal.', correlationId);
+        }
+        if (idemCheck.status === 'HIT') {
+          return jsonResponse(idemCheck.record.body, idemCheck.record.statusCode);
+        }
+
+        const orig = edgeState.transactions.get(txnId);
+        if (!orig) return apiError(404, 'TRANSACTION_NOT_FOUND', 'Transaction not found.', correlationId);
+        if (orig.status === TransactionStatus.REVERSED) {
+          return apiError(409, 'ALREADY_REVERSED', 'Transaction has already been reversed.', correlationId);
+        }
+        const origEntry = edgeState.journalEntries.find((e) => e.transactionId === txnId);
+        const origLines = origEntry ? edgeState.journalLines.filter((l) => l.entryId === origEntry.id) : [];
+        if (origLines.length === 0) {
+          return apiError(400, 'JOURNAL_NOT_FOUND', 'Original journal lines unavailable for reversal.', correlationId);
+        }
+
+        const revLegs = origLines.map((l) => ({
+          ledgerAccountId: l.ledgerAccountId,
+          direction: l.direction === JournalDirection.DEBIT ? JournalDirection.CREDIT : JournalDirection.DEBIT,
+          amountMinor: l.amountMinor,
+          currency: l.currency,
+        }));
+
+        const posted = postAtomicEdgeTransaction({
+          type: TransactionType.REVERSAL,
+          amountMinor: orig.amountMinor,
+          feeMinor: orig.feeMinor,
+          currency: orig.currency,
+          fromAccountId: orig.toAccountId,
+          toAccountId: orig.fromAccountId,
+          reference: `REV-${orig.reference}`,
+          idempotencyKey: `rev_${txnId}_${idemKey}`,
+          description: `Reversal of ${orig.reference}: ${reason}`,
+          legs: revLegs,
+          metadata: { reversedTransactionId: txnId, reason },
+        });
+        orig.status = TransactionStatus.REVERSED;
+        const now = new Date().toISOString();
+        const audit = addAudit(user.id, 'ADMIN', 'TRANSACTION_REVERSED', `txn:${txnId}`, { reversalId: posted.txn.id, reason });
+        const respBody = { reversal: posted.txn };
+        const idemRec: IdempotencyRecord = {
+          key: idemKey,
+          scope: 'adm_txn_rev',
+          userId: user.id,
+          payloadHash: idemCheck.payloadHash,
+          statusCode: 201,
+          body: respBody,
+          createdAt: now,
+        };
+        edgeState.idempotencyResponses.set(idemCheck.cacheKey, idemRec);
+
+        await persistEdgeWrites(env, [
+          { collection: 'transactions', id: orig.id, data: orig as unknown as Record<string, unknown> },
+          { collection: 'transactions', id: posted.txn.id, data: posted.txn as unknown as Record<string, unknown> },
+          { collection: 'journal_entries', id: posted.je.id, data: posted.je as unknown as Record<string, unknown> },
+          ...posted.jl.map((l) => ({ collection: 'journal_lines', id: l.id, data: l as unknown as Record<string, unknown> })),
+          ...posted.touchedLedgerAccounts.map((l) => ({ collection: 'ledger_accounts', id: l.id, data: l as unknown as Record<string, unknown> })),
+          { collection: 'idempotency_keys', id: idemCheck.cacheKey, data: idemRec as unknown as Record<string, unknown>, mustNotExist: true },
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse(respBody, 201);
       }
 
       if (method === 'GET' && path === '/admin/fees') {
+        await syncEdgeFromCloud(env);
         return jsonResponse({ feeRules: [...edgeState.feeRules.values()] });
       }
 
       if (method === 'PUT' && path === '/admin/fees') {
         if (!requirePerm('fees:write')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing fees:write', correlationId);
+        const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'fees_write' });
+        if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
         const parsed = feeRuleUpdateSchema.safeParse(body);
         if (!parsed.success) return apiError(400, 'VALIDATION_ERROR', parsed.error.issues[0].message, correlationId);
-        const id = `fee_${parsed.data.transactionType}_${parsed.data.currency}`;
-        const updated: FeeRuleRecord = {
-          id,
-          ...parsed.data,
-          updatedAt: new Date().toISOString(),
-          changedBy: user.id,
+        const approval: ApprovalRecord = {
+          id: `apr_${crypto.randomUUID()}`,
+          entityType: 'FEE_RULE',
+          entityId: `fee_${parsed.data.transactionType}_${parsed.data.currency}`,
+          payload: parsed.data as unknown as Record<string, unknown>,
+          requestedBy: user.id,
+          approvedBy: null,
+          status: 'PENDING',
+          reason: typeof body.reason === 'string' ? body.reason : 'Fee schedule adjustment',
+          createdAt: new Date().toISOString(),
+          decidedAt: null,
         };
-        edgeState.feeRules.set(id, updated);
-        return jsonResponse({ status: 'APPLIED', rule: updated });
+        edgeState.approvals.set(approval.id, approval);
+        const audit = addAudit(user.id, 'ADMIN', 'APPROVAL_REQUESTED', `approval:${approval.id}`, { entityType: approval.entityType });
+        await persistEdgeWrites(env, [
+          { collection: 'approvals', id: approval.id, data: approval as unknown as Record<string, unknown> },
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ approval, message: 'Fee rule change queued for second Super Admin approval.' }, 202);
       }
 
       if (method === 'GET' && path === '/admin/limits') {
+        await syncEdgeFromCloud(env);
         return jsonResponse({ limitRules: [...edgeState.limitRules.values()] });
       }
 
       if (method === 'PUT' && path === '/admin/limits') {
         if (!requirePerm('limits:write')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing limits:write', correlationId);
+        const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'limits_write' });
+        if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
         const parsed = limitRuleUpdateSchema.safeParse(body);
         if (!parsed.success) return apiError(400, 'VALIDATION_ERROR', parsed.error.issues[0].message, correlationId);
-        const id = `lim_${parsed.data.scope}_${parsed.data.currency}`;
-        const updated: LimitRuleRecord = {
-          id,
-          ...parsed.data,
-          updatedAt: new Date().toISOString(),
+        const approval: ApprovalRecord = {
+          id: `apr_${crypto.randomUUID()}`,
+          entityType: 'LIMIT_RULE',
+          entityId: `lim_${parsed.data.scope}_${parsed.data.scopeId}_${parsed.data.transactionType}_${parsed.data.currency}`,
+          payload: parsed.data as unknown as Record<string, unknown>,
+          requestedBy: user.id,
+          approvedBy: null,
+          status: 'PENDING',
+          reason: typeof body.reason === 'string' ? body.reason : 'Limit rule adjustment',
+          createdAt: new Date().toISOString(),
+          decidedAt: null,
         };
-        edgeState.limitRules.set(id, updated);
-        return jsonResponse({ status: 'APPLIED', rule: updated });
+        edgeState.approvals.set(approval.id, approval);
+        const audit = addAudit(user.id, 'ADMIN', 'APPROVAL_REQUESTED', `approval:${approval.id}`, { entityType: approval.entityType });
+        await persistEdgeWrites(env, [
+          { collection: 'approvals', id: approval.id, data: approval as unknown as Record<string, unknown> },
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ approval, message: 'Limit rule change queued for second Super Admin approval.' }, 202);
       }
 
       if (method === 'GET' && path === '/admin/rbac') {
@@ -2204,6 +3597,8 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
       }
 
       if (method === 'GET' && path === '/admin/staff') {
+        if (!requirePerm('staff:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing staff:read', correlationId);
+        await syncEdgeFromCloud(env);
         const staff = [...edgeState.users.values()]
           .filter((u) => ADMIN_ROLES.includes(u.role))
           .map((u) => ({
@@ -2213,7 +3608,7 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
           }));
         return jsonResponse({
           staff,
-          approvals: [...edgeState.approvals.values()],
+          approvals: [...edgeState.approvals.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
           rbacRules: [...edgeState.rbacRules.values()],
         });
       }
@@ -2223,14 +3618,34 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         if (!requirePerm('staff:write')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Super Admin permission required.', correlationId);
         const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'staff_approve' });
         if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff PIN verification required.', correlationId);
+        await syncEdgeFromCloud(env);
         const target = edgeState.users.get(staffAppMatch[1]);
         if (!target) return apiError(404, 'USER_NOT_FOUND', 'Staff member not found.', correlationId);
+        const now = new Date().toISOString();
         target.staffStatus = body.decision === 'REJECTED' ? 'REJECTED' : 'APPROVED';
         if (body.assignedRole && ADMIN_ROLES.includes(body.assignedRole as Role)) {
           target.role = body.assignedRole as Role;
         }
+        target.version = (target.version ?? 1) + 1;
+        target.updatedAt = now;
+        const notifs = enqueueEdgeNotification({
+          userId: target.id,
+          channels: [NotificationChannel.IN_APP, NotificationChannel.PUSH, NotificationChannel.EMAIL],
+          template: 'STAFF_ACCOUNT_DECISION_v1',
+          title: `Staff Account ${target.staffStatus}`,
+          body: `Your Back-Office account has been ${target.staffStatus} with role ${target.role}.`,
+        });
+        const audit = addAudit(user.id, 'ADMIN', 'STAFF_DECISION', `user:${target.id}`, {
+          staffStatus: target.staffStatus,
+          role: target.role,
+        });
         await kvSyncUser(env, target.id);
-        return jsonResponse({ user: sanitizeUser(target) });
+        await persistEdgeWrites(env, [
+          { collection: 'users', id: target.id, data: target as unknown as Record<string, unknown> },
+          ...notifs.map((n) => ({ collection: 'notifications', id: n.id, data: n as unknown as Record<string, unknown> })),
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ staff: sanitizeUser(target), user: sanitizeUser(target) });
       }
 
       const staffRoleMatch = path.match(/^\/admin\/staff\/([^/]+)\/role$/);
@@ -2238,38 +3653,210 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
         if (!requirePerm('staff:write')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Super Admin permission required.', correlationId);
         const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'staff_role' });
         if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff PIN verification required.', correlationId);
+        await syncEdgeFromCloud(env);
         const target = edgeState.users.get(staffRoleMatch[1]);
         if (!target) return apiError(404, 'USER_NOT_FOUND', 'Staff member not found.', correlationId);
-        if (ADMIN_ROLES.includes(body.role as Role)) {
-          target.role = body.role as Role;
-          target.staffStatus = 'APPROVED';
+        const newRole = body.role as Role;
+        if (!ADMIN_ROLES.includes(newRole)) {
+          return apiError(400, 'INVALID_ROLE', 'Invalid admin role.', correlationId);
         }
-        await kvSyncUser(env, target.id);
-        return jsonResponse({ user: sanitizeUser(target) });
+        const approval: ApprovalRecord = {
+          id: `apr_${crypto.randomUUID()}`,
+          entityType: 'STAFF_ROLE',
+          entityId: target.id,
+          payload: { userId: target.id, newRole },
+          requestedBy: user.id,
+          approvedBy: null,
+          status: 'PENDING',
+          reason: String(body.reason || 'Staff role update'),
+          createdAt: new Date().toISOString(),
+          decidedAt: null,
+        };
+        edgeState.approvals.set(approval.id, approval);
+        const audit = addAudit(user.id, 'ADMIN', 'STAFF_ROLE_CHANGE_REQUESTED', `user:${target.id}`, { newRole });
+        await persistEdgeWrites(env, [
+          { collection: 'approvals', id: approval.id, data: approval as unknown as Record<string, unknown> },
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ approval, message: 'Role change queued for second approver.' }, 202);
+      }
+
+      const approvalDecMatch = path.match(/^\/admin\/approvals\/([^/]+)\/decide$/);
+      if (method === 'POST' && approvalDecMatch) {
+        if (!requirePerm('approvals:decide')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing approvals:decide', correlationId);
+        const step = await verifyStepUpEdge(request, user.id, 'admin_action', secrets, { adminAction: 'approval_decide' });
+        if (!step) return apiError(403, 'ADMIN_PIN_REQUIRED', 'Staff 6-digit PIN verification required.', correlationId);
+        await syncEdgeFromCloud(env);
+        const apr = edgeState.approvals.get(approvalDecMatch[1]);
+        if (!apr) return apiError(404, 'APPROVAL_NOT_FOUND', 'Approval record not found.', correlationId);
+        if (apr.status !== 'PENDING') return apiError(409, 'ALREADY_DECIDED', 'Approval already decided.', correlationId);
+        if (apr.requestedBy === user.id) {
+          return apiError(403, 'DUAL_CONTROL_VIOLATION', 'Second approval must come from a different Super Admin.', correlationId);
+        }
+        const decision = body.decision === 'REJECTED' ? 'REJECTED' : 'APPROVED';
+        const now = new Date().toISOString();
+        apr.status = decision;
+        apr.approvedBy = user.id;
+        apr.decidedAt = now;
+        if (typeof body.reason === 'string') apr.reason = body.reason;
+
+        const writes: EdgeCloudWrite[] = [
+          { collection: 'approvals', id: apr.id, data: apr as unknown as Record<string, unknown> },
+        ];
+        if (decision === 'APPROVED') {
+          if (apr.entityType === 'FEE_RULE') {
+            const p = apr.payload as unknown as Omit<FeeRuleRecord, 'id' | 'updatedAt' | 'changedBy'>;
+            const rule: FeeRuleRecord = {
+              id: apr.entityId,
+              ...p,
+              updatedAt: now,
+              changedBy: user.id,
+            };
+            edgeState.feeRules.set(rule.id, rule);
+            writes.push({ collection: 'fee_rules', id: rule.id, data: rule as unknown as Record<string, unknown> });
+          } else if (apr.entityType === 'LIMIT_RULE') {
+            const p = apr.payload as unknown as Omit<LimitRuleRecord, 'id' | 'updatedAt'>;
+            const rule: LimitRuleRecord = {
+              id: apr.entityId,
+              ...p,
+              updatedAt: now,
+            };
+            edgeState.limitRules.set(rule.id, rule);
+            writes.push({ collection: 'limit_rules', id: rule.id, data: rule as unknown as Record<string, unknown> });
+          } else if (apr.entityType === 'STAFF_ROLE') {
+            const target = edgeState.users.get(String(apr.payload.userId));
+            if (target && ADMIN_ROLES.includes(apr.payload.newRole as Role)) {
+              target.role = apr.payload.newRole as Role;
+              target.staffStatus = 'APPROVED';
+              target.version = (target.version ?? 1) + 1;
+              target.updatedAt = now;
+              await kvSyncUser(env, target.id);
+              writes.push({ collection: 'users', id: target.id, data: target as unknown as Record<string, unknown> });
+            }
+          }
+        }
+        const audit = addAudit(user.id, 'ADMIN', `APPROVAL_${decision}`, `approval:${apr.id}`);
+        writes.push({ collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> });
+        await persistEdgeWrites(env, writes);
+        return jsonResponse({ approval: apr });
       }
 
       if (method === 'GET' && path === '/admin/audit-logs') {
+        if (!requirePerm('audit:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing audit:read', correlationId);
+        await syncEdgeFromCloud(env);
         return jsonResponse({ auditLogs: [...edgeState.auditLogs].reverse() });
       }
 
       if (method === 'GET' && path === '/admin/reconciliation') {
-        return jsonResponse({ runs: [...edgeState.reconciliationRuns.values()], ledgerInvariant: { valid: true } });
+        if (!requirePerm('reconciliation:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing reconciliation:read', correlationId);
+        await syncEdgeFromCloud(env);
+        return jsonResponse({
+          runs: [...edgeState.reconciliationRuns.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+          ledgerInvariant: verifyEdgeLedgerInvariant(),
+        });
+      }
+
+      if (method === 'POST' && path === '/admin/reconciliation/run') {
+        if (!requirePerm('reconciliation:resolve')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing reconciliation:resolve', correlationId);
+        await syncEdgeFromCloud(env);
+        const currency = (body.currency as Currency) || Currency.USD;
+        const bankTotal = edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.BANK_SETTLEMENT}_${currency}`)?.cachedBalanceMinor ?? 0;
+        const external = typeof body.externalBankTotalMinor === 'number' ? body.externalBankTotalMinor : bankTotal;
+        const diff = bankTotal - external;
+        const run: ReconciliationRunRecord = {
+          id: `rec_${crypto.randomUUID()}`,
+          date: new Date().toISOString().slice(0, 10),
+          currency,
+          ledgerTotalMinor: bankTotal,
+          bankTotalMinor: external,
+          differenceMinor: diff,
+          status: diff === 0 ? 'MATCHED' : 'DISCREPANCY',
+          resolvedBy: null,
+          note: diff === 0 ? 'Matched cleanly' : 'Discrepancy detected',
+          createdAt: new Date().toISOString(),
+        };
+        edgeState.reconciliationRuns.set(run.id, run);
+        await persistEdgeWrites(env, [
+          { collection: 'reconciliation_runs', id: run.id, data: run as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ run }, 201);
+      }
+
+      const recResMatch = path.match(/^\/admin\/reconciliation\/([^/]+)\/resolve$/);
+      if (method === 'POST' && recResMatch) {
+        if (!requirePerm('reconciliation:resolve')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing reconciliation:resolve', correlationId);
+        const run = edgeState.reconciliationRuns.get(recResMatch[1]);
+        if (!run) return apiError(404, 'RECON_NOT_FOUND', 'Reconciliation run not found.', correlationId);
+        run.status = 'RESOLVED';
+        run.resolvedBy = user.id;
+        run.note = String(body.note || 'Reviewed and cleared.');
+        const audit = addAudit(user.id, 'ADMIN', 'RECONCILIATION_RESOLVED', `recon:${run.id}`);
+        await persistEdgeWrites(env, [
+          { collection: 'reconciliation_runs', id: run.id, data: run as unknown as Record<string, unknown> },
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ run });
       }
 
       if (method === 'GET' && path === '/admin/risk-flags') {
-        return jsonResponse({ flags: [...edgeState.riskFlags.values()] });
+        if (!requirePerm('risk:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing risk:read', correlationId);
+        await syncEdgeFromCloud(env);
+        return jsonResponse({ flags: [...edgeState.riskFlags.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)) });
+      }
+
+      const riskResMatch = path.match(/^\/admin\/risk-flags\/([^/]+)\/resolve$/);
+      if (method === 'POST' && riskResMatch) {
+        if (!requirePerm('risk:resolve')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing risk:resolve', correlationId);
+        const flag = edgeState.riskFlags.get(riskResMatch[1]);
+        if (!flag) return apiError(404, 'FLAG_NOT_FOUND', 'Risk flag not found.', correlationId);
+        const status = ['INVESTIGATING', 'RESOLVED', 'FALSE_POSITIVE'].includes(String(body.status))
+          ? (body.status as RiskFlagRecord['status'])
+          : 'RESOLVED';
+        flag.status = status;
+        flag.resolvedBy = user.id;
+        flag.resolutionNote = String(body.note || 'Reviewed');
+        flag.resolvedAt = status === 'INVESTIGATING' ? null : new Date().toISOString();
+        const audit = addAudit(user.id, 'ADMIN', 'RISK_FLAG_UPDATED', `risk:${flag.id}`, { status });
+        await persistEdgeWrites(env, [
+          { collection: 'risk_flags', id: flag.id, data: flag as unknown as Record<string, unknown> },
+          { collection: 'audit_logs', id: audit.id, data: audit as unknown as Record<string, unknown> },
+        ]);
+        return jsonResponse({ flag });
       }
 
       if (method === 'GET' && path === '/admin/reports/summary') {
+        if (!requirePerm('reports:read')) return apiError(403, 'INSUFFICIENT_PERMISSIONS', 'Missing reports:read', correlationId);
+        await syncEdgeFromCloud(env);
+        const txns = [...edgeState.transactions.values()];
+        const totalVolumeUsdMinor = txns
+          .filter((t) => t.currency === Currency.USD && t.status === TransactionStatus.COMPLETED)
+          .reduce((acc, t) => acc + t.amountMinor, 0);
+        const totalFeesUsdMinor = txns
+          .filter((t) => t.currency === Currency.USD && t.status === TransactionStatus.COMPLETED)
+          .reduce((acc, t) => acc + t.feeMinor, 0);
         return jsonResponse({
-          currencies: [Currency.USD, Currency.ZWG, Currency.ZAR].map((c) => ({
-            currency: c,
-            userLiabilitiesMinor: 0,
-            bankSettlementMinor: 0,
-            feeRevenueMinor: 0,
-            withdrawalHoldMinor: 0,
-          })),
-          totalTransactions: edgeState.transactions.size,
+          generatedAt: new Date().toISOString(),
+          totalVolumeUsdMinor,
+          totalFeesUsdMinor,
+          transactionCount: txns.length,
+          kycApprovedUsers: [...edgeState.users.values()].filter((u) => u.kycStatus === KycStatus.APPROVED).length,
+          openRiskFlags: [...edgeState.riskFlags.values()].filter((r) => !r.resolvedAt).length,
+          currencies: [Currency.USD, Currency.ZWG, Currency.ZAR].map((c) => {
+            let userLiabilitiesMinor = 0;
+            for (const la of edgeState.ledgerAccounts.values()) {
+              if (la.currency === c && la.type === LedgerAccountType.USER_WALLET) {
+                userLiabilitiesMinor += la.cachedBalanceMinor;
+              }
+            }
+            return {
+              currency: c,
+              userLiabilitiesMinor,
+              bankSettlementMinor: edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.BANK_SETTLEMENT}_${c}`)?.cachedBalanceMinor ?? 0,
+              feeRevenueMinor: edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.FEE_REVENUE}_${c}`)?.cachedBalanceMinor ?? 0,
+              withdrawalHoldMinor: edgeState.ledgerAccounts.get(`sys_${LedgerAccountType.WITHDRAWAL_HOLD}_${c}`)?.cachedBalanceMinor ?? 0,
+            };
+          }),
+          totalTransactions: txns.length,
           pendingApprovals: [...edgeState.approvals.values()].filter((a) => a.status === 'PENDING').length,
         });
       }
@@ -2279,6 +3866,15 @@ export async function handleEdgeApiRequest(request: Request, env: CloudflareEnv)
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unexpected edge error';
     const [code, ...rest] = msg.includes(':') ? msg.split(':') : ['REQUEST_ERROR', msg];
-    return apiError(400, code, rest.join(':').trim() || msg, correlationId);
+    const cleanCode = code.trim();
+    const status =
+      cleanCode.includes('CONFLICT') || cleanCode.includes('DUPLICATE')
+        ? 409
+        : cleanCode.includes('FORBIDDEN') || cleanCode.includes('VIOLATION')
+          ? 403
+          : cleanCode.includes('NOT_FOUND')
+            ? 404
+            : 400;
+    return apiError(status, cleanCode, rest.join(':').trim() || msg, correlationId);
   }
 }

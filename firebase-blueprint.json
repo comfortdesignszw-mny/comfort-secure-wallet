@@ -2,7 +2,7 @@
   "entities": {
     "UserAccount": {
       "title": "UserAccount",
-      "description": "Core user/staff identity, approval state, and verification status",
+      "description": "Core user and staff identity, approval state, and verification status",
       "type": "object",
       "properties": {
         "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -14,8 +14,10 @@
         "status": { "type": "string", "enum": ["ACTIVE", "FROZEN", "CLOSED"] },
         "kycStatus": { "type": "string", "enum": ["NOT_SUBMITTED", "PENDING", "APPROVED", "REJECTED", "NEEDS_MORE_INFO"] },
         "kycTier": { "type": "integer" },
+        "version": { "type": "integer" },
         "legalAcceptedAt": { "type": "string", "format": "date-time" },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "role", "staffStatus", "status", "kycStatus", "kycTier", "createdAt"]
     },
@@ -33,10 +35,10 @@
     },
     "UserPrivateProfile": {
       "title": "UserPrivateProfile",
-      "description": "Encrypted PII profile isolated under private subcollection",
+      "description": "Encrypted PII profile isolated under private storage",
       "type": "object",
       "properties": {
-        "userId": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "fullName": { "type": "string", "maxLength": 160 },
         "dateOfBirth": { "type": "string", "maxLength": 20 },
         "nationalIdEncrypted": { "type": "string", "maxLength": 512 },
@@ -50,47 +52,113 @@
       "description": "Multi-currency wallet with 10-digit Luhn account number",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "maxLength": 128 },
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "userId": { "type": "string", "maxLength": 128 },
         "accountNumber": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^[0-9]{10}$" },
         "currency": { "type": "string", "enum": ["USD", "ZWG", "ZAR"] },
-        "status": { "type": "string", "enum": ["ACTIVE", "FROZEN", "CLOSED"] }
+        "status": { "type": "string", "enum": ["ACTIVE", "FROZEN", "CLOSED"] },
+        "version": { "type": "integer" }
       },
       "required": ["id", "userId", "accountNumber", "currency", "status"]
+    },
+    "LedgerAccount": {
+      "title": "LedgerAccount",
+      "description": "System and user wallet ledger accounts with cached minor-unit balances",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": { "type": "string", "enum": ["USER_WALLET", "BANK_SETTLEMENT", "FEE_REVENUE", "WITHDRAWAL_HOLD", "SUSPENSE"] },
+        "currency": { "type": "string", "enum": ["USD", "ZWG", "ZAR"] },
+        "cachedBalanceMinor": { "type": "integer" }
+      },
+      "required": ["id", "type", "currency", "cachedBalanceMinor"]
     },
     "LedgerTransaction": {
       "title": "LedgerTransaction",
       "description": "Immutable idempotent transaction summary",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "maxLength": 128 },
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128 },
         "type": { "type": "string", "enum": ["deposit", "withdrawal", "transfer", "fee", "reversal"] },
         "status": { "type": "string", "enum": ["PENDING", "COMPLETED", "FAILED", "REVERSED"] },
         "amountMinor": { "type": "integer" },
         "feeMinor": { "type": "integer" },
         "currency": { "type": "string", "enum": ["USD", "ZWG", "ZAR"] },
-        "idempotencyKey": { "type": "string", "maxLength": 128 }
+        "idempotencyKey": { "type": "string", "maxLength": 128 },
+        "version": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["id", "type", "status", "amountMinor", "feeMinor", "currency", "idempotencyKey"]
+      "required": ["id", "userId", "type", "status", "amountMinor", "feeMinor", "currency", "idempotencyKey"]
     },
     "JournalEntry": {
       "title": "JournalEntry",
       "description": "Immutable double-entry journal entry",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "maxLength": 128 },
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "transactionId": { "type": "string", "maxLength": 128 },
         "description": { "type": "string", "maxLength": 256 },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "transactionId", "description", "createdAt"]
     },
+    "JournalLine": {
+      "title": "JournalLine",
+      "description": "Immutable debit/credit journal line belonging to a journal entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "journalEntryId": { "type": "string", "maxLength": 128 },
+        "ledgerAccountId": { "type": "string", "maxLength": 128 },
+        "direction": { "type": "string", "enum": ["debit", "credit"] },
+        "amountMinor": { "type": "integer" },
+        "currency": { "type": "string", "enum": ["USD", "ZWG", "ZAR"] }
+      },
+      "required": ["id", "journalEntryId", "ledgerAccountId", "direction", "amountMinor", "currency"]
+    },
+    "DepositRequest": {
+      "title": "DepositRequest",
+      "description": "Customer Add Money deposit request awaiting Maker/Checker approval",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128 },
+        "accountId": { "type": "string", "maxLength": 128 },
+        "amountMinor": { "type": "integer" },
+        "currency": { "type": "string", "enum": ["USD", "ZWG", "ZAR"] },
+        "paymentReference": { "type": "string", "maxLength": 128 },
+        "status": { "type": "string", "enum": ["PENDING", "MAKER_APPROVED", "APPROVED", "REJECTED"] },
+        "version": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "accountId", "amountMinor", "currency", "paymentReference", "status", "createdAt"]
+    },
+    "WithdrawalRequest": {
+      "title": "WithdrawalRequest",
+      "description": "Customer withdrawal request with Maker/Checker approval and hold release",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128 },
+        "accountId": { "type": "string", "maxLength": 128 },
+        "amountMinor": { "type": "integer" },
+        "feeMinor": { "type": "integer" },
+        "currency": { "type": "string", "enum": ["USD", "ZWG", "ZAR"] },
+        "status": { "type": "string", "enum": ["PENDING", "MAKER_APPROVED", "CHECKER_APPROVED", "PAID", "REJECTED"] },
+        "version": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "accountId", "amountMinor", "feeMinor", "currency", "status", "createdAt"]
+    },
     "NotificationItem": {
       "title": "NotificationItem",
       "description": "Enforced transaction and security push/in-app/email/SMS alerts",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "maxLength": 128 },
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "userId": { "type": "string", "maxLength": 128 },
         "channel": { "type": "string", "enum": ["SMS", "EMAIL", "PUSH", "IN_APP"] },
         "template": { "type": "string", "maxLength": 64 },
@@ -100,12 +168,36 @@
       },
       "required": ["id", "userId", "channel", "template", "title", "body", "createdAt"]
     },
+    "IdempotencyKeyRecord": {
+      "title": "IdempotencyKeyRecord",
+      "description": "Canonical request idempotency lock and cached response",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "maxLength": 128 },
+        "scope": { "type": "string", "maxLength": 64 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "payloadHash": { "type": "string", "maxLength": 128 },
+        "statusCode": { "type": "integer" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["key", "scope", "userId", "payloadHash", "statusCode", "createdAt"]
+    },
+    "SystemSyncState": {
+      "title": "SystemSyncState",
+      "description": "Monotonic cloud sync revision and timestamp metadata",
+      "type": "object",
+      "properties": {
+        "syncRevision": { "type": "integer" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["syncRevision", "updatedAt"]
+    },
     "AuditLog": {
       "title": "AuditLog",
       "description": "Append-only security and admin audit trail",
       "type": "object",
       "properties": {
-        "id": { "type": "string", "maxLength": 128 },
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "actorId": { "type": "string", "maxLength": 128 },
         "actorType": { "type": "string", "maxLength": 32 },
         "action": { "type": "string", "maxLength": 128 },
@@ -113,9 +205,23 @@
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "actorId", "actorType", "action", "entity", "createdAt"]
+    },
+    "BackOfficeConfigItem": {
+      "title": "BackOfficeConfigItem",
+      "description": "Server-managed fee rules, limit rules, approvals, risk flags, KYC documents, pins, sessions, and reconciliation records",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id"]
     }
   },
   "firestore": {
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Server-managed administrator membership records"
+    },
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/UserAccount" },
       "description": "User and staff account metadata"
@@ -123,6 +229,22 @@
     "/users/{userId}/private/profile": {
       "schema": { "$ref": "#/entities/UserPrivateProfile" },
       "description": "Isolated PII and encrypted national ID"
+    },
+    "/user_profiles/{userId}": {
+      "schema": { "$ref": "#/entities/UserPrivateProfile" },
+      "description": "Server-managed KYC profile store"
+    },
+    "/kyc_documents/{docId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Server-managed KYC document metadata"
+    },
+    "/pins/{userId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Server-only argon2id/PBKDF2 salted & peppered PIN hashes"
+    },
+    "/sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Server-only rotating refresh session records"
     },
     "/rbac_rules/{role}": {
       "schema": { "$ref": "#/entities/RbacRule" },
@@ -132,6 +254,10 @@
       "schema": { "$ref": "#/entities/WalletAccount" },
       "description": "Multi-currency wallet accounts"
     },
+    "/ledger_accounts/{ledgerAccountId}": {
+      "schema": { "$ref": "#/entities/LedgerAccount" },
+      "description": "Double-entry ledger accounts"
+    },
     "/transactions/{transactionId}": {
       "schema": { "$ref": "#/entities/LedgerTransaction" },
       "description": "Immutable transaction records"
@@ -140,9 +266,57 @@
       "schema": { "$ref": "#/entities/JournalEntry" },
       "description": "Immutable double-entry journal entries"
     },
+    "/journal_lines/{lineId}": {
+      "schema": { "$ref": "#/entities/JournalLine" },
+      "description": "Immutable double-entry debit/credit lines"
+    },
+    "/deposit_requests/{depositId}": {
+      "schema": { "$ref": "#/entities/DepositRequest" },
+      "description": "Customer Add Money requests and Maker/Checker review status"
+    },
+    "/withdrawal_requests/{withdrawalId}": {
+      "schema": { "$ref": "#/entities/WithdrawalRequest" },
+      "description": "Customer withdrawal requests and Maker/Checker payout status"
+    },
     "/notifications/{notificationId}": {
       "schema": { "$ref": "#/entities/NotificationItem" },
       "description": "Transaction and security notification records"
+    },
+    "/notification_preferences/{userId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "User notification delivery preferences"
+    },
+    "/fee_rules/{ruleId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Server-managed fee rules"
+    },
+    "/limit_rules/{ruleId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Server-managed withdrawal and transfer limit rules"
+    },
+    "/approvals/{approvalId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Dual-control staff role & rule change approvals"
+    },
+    "/risk_flags/{flagId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Automated velocity, device, and failure risk flags"
+    },
+    "/reconciliation_runs/{runId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Daily double-entry ledger reconciliation snapshots"
+    },
+    "/support_notes/{noteId}": {
+      "schema": { "$ref": "#/entities/BackOfficeConfigItem" },
+      "description": "Internal back-office support notes"
+    },
+    "/idempotency_keys/{idemId}": {
+      "schema": { "$ref": "#/entities/IdempotencyKeyRecord" },
+      "description": "Server-enforced canonical idempotency locks"
+    },
+    "/system_meta/{metaId}": {
+      "schema": { "$ref": "#/entities/SystemSyncState" },
+      "description": "Server-only global cloud sync revision state"
     },
     "/audit_logs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },

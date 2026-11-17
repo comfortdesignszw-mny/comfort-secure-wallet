@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { Upload } from 'lucide-react';
 import { DepositRequestRecord } from '../../shared/types.ts';
 import { formatMinorUnits, parseDecimalToMinorUnits } from '../../shared/money.ts';
@@ -25,8 +25,14 @@ export const AddMoneyView: React.FC<AddMoneyViewProps> = ({ accounts, deposits, 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
+  const draftIdemKeyRef = useRef(newIdempotencyKey());
 
   const selectedAcc = accounts.find((a) => a.id === accountId) || accounts[0];
+
+  const resetDraftKey = () => {
+    draftIdemKeyRef.current = newIdempotencyKey();
+  };
 
   const handleFile = (file: File) => {
     const reader = new FileReader();
@@ -36,7 +42,8 @@ export const AddMoneyView: React.FC<AddMoneyViewProps> = ({ accounts, deposits, 
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedAcc) return;
+    if (!selectedAcc || inFlightRef.current || submitting) return;
+    inFlightRef.current = true;
     setSubmitting(true);
     setError(null);
     setSuccessMsg(null);
@@ -44,7 +51,7 @@ export const AddMoneyView: React.FC<AddMoneyViewProps> = ({ accounts, deposits, 
       const amountMinor = parseDecimalToMinorUnits(amountInput, selectedAcc.currency);
       await apiFetch('/deposits/requests', {
         method: 'POST',
-        idempotencyKey: newIdempotencyKey(),
+        idempotencyKey: draftIdemKeyRef.current,
         body: JSON.stringify({
           accountId: selectedAcc.id,
           amountMinor,
@@ -54,13 +61,15 @@ export const AddMoneyView: React.FC<AddMoneyViewProps> = ({ accounts, deposits, 
           proofDataUrl: proofDataUrl || createSampleProofDataUrl(paymentReference),
         }),
       });
+      draftIdemKeyRef.current = newIdempotencyKey();
       setPaymentReference('');
       setProofDataUrl('');
-      setSuccessMsg('Deposit request submitted. Finance Maker & Checker will verify your payment reference.');
+      setSuccessMsg('Deposit request submitted and synced to Back-Office immediately for Maker/Checker approval.');
       await onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to submit deposit request');
     } finally {
+      inFlightRef.current = false;
       setSubmitting(false);
     }
   };
@@ -79,7 +88,10 @@ export const AddMoneyView: React.FC<AddMoneyViewProps> = ({ accounts, deposits, 
               <label className="block text-xs font-medium text-slate-700 mb-1.5">Destination Wallet</label>
               <select
                 value={selectedAcc?.id || ''}
-                onChange={(e) => setAccountId(e.target.value)}
+                onChange={(e) => {
+                  setAccountId(e.target.value);
+                  resetDraftKey();
+                }}
                 className="w-full h-11 rounded-xl border border-slate-200 px-3 text-sm bg-white"
               >
                 {accounts.map((a) => (
@@ -93,7 +105,10 @@ export const AddMoneyView: React.FC<AddMoneyViewProps> = ({ accounts, deposits, 
               <label className="block text-xs font-medium text-slate-700 mb-1.5">Method</label>
               <select
                 value={method}
-                onChange={(e) => setMethod(e.target.value as typeof method)}
+                onChange={(e) => {
+                  setMethod(e.target.value as typeof method);
+                  resetDraftKey();
+                }}
                 className="w-full h-11 rounded-xl border border-slate-200 px-3 text-sm bg-white"
               >
                 <option value="ECOCASH">EcoCash</option>
@@ -114,7 +129,10 @@ export const AddMoneyView: React.FC<AddMoneyViewProps> = ({ accounts, deposits, 
                 inputMode="decimal"
                 required
                 value={amountInput}
-                onChange={(e) => setAmountInput(e.target.value)}
+                onChange={(e) => {
+                  setAmountInput(e.target.value);
+                  resetDraftKey();
+                }}
                 className="w-full h-11 rounded-xl border border-slate-200 px-3.5 font-mono text-sm"
               />
             </div>
@@ -124,7 +142,10 @@ export const AddMoneyView: React.FC<AddMoneyViewProps> = ({ accounts, deposits, 
                 type="text"
                 required
                 value={paymentReference}
-                onChange={(e) => setPaymentReference(e.target.value)}
+                onChange={(e) => {
+                  setPaymentReference(e.target.value);
+                  resetDraftKey();
+                }}
                 placeholder="e.g. ECO-2026-55912"
                 className="w-full h-11 rounded-xl border border-slate-200 px-3.5 font-mono text-sm uppercase"
               />
@@ -159,9 +180,9 @@ export const AddMoneyView: React.FC<AddMoneyViewProps> = ({ accounts, deposits, 
           <button
             type="submit"
             disabled={submitting}
-            className="w-full h-12 rounded-xl bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 disabled:opacity-60"
+            className="w-full h-12 rounded-xl bg-emerald-700 text-white text-sm font-semibold hover:bg-emerald-800 active:scale-[0.98] transition-all cursor-pointer disabled:opacity-60 disabled:pointer-events-none"
           >
-            {submitting ? 'Submitting...' : 'Submit Deposit Request'}
+            {submitting ? 'Syncing Deposit Request...' : 'Submit Deposit Request'}
           </button>
         </form>
       </section>

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { KycDocumentRecord, KycStatus, NotificationChannel, UserProfileRecord } from '../../../shared/types.ts';
+import { broadcastSyncEvent } from '../../db/realtime.ts';
 import { dbStore } from '../../db/store.ts';
 import { decryptField, encryptBuffer, encryptField, signStorageKey } from '../../security/crypto.ts';
 import { recordAuditLog } from '../../security/audit.ts';
@@ -81,6 +82,8 @@ class KycService {
     dbStore.kycDocuments.set(selfieDoc.id, selfieDoc);
 
     user.kycStatus = KycStatus.PENDING;
+    user.version = (user.version ?? 1) + 1;
+    user.updatedAt = now;
 
     recordAuditLog({
       actorId: userId,
@@ -88,6 +91,22 @@ class KycService {
       action: 'KYC_SUBMITTED',
       entity: `user:${userId}`,
       after: { kycStatus: KycStatus.PENDING, documentType: payload.documentType },
+    });
+
+    const { passwordHash: _pw, ...safeUser } = user;
+    const rev = await dbStore.persistImmediate([
+      { collection: 'users', id: user.id, data: safeUser as unknown as Record<string, unknown> },
+      { collection: 'kyc_documents', id: idDoc.id, data: idDoc as unknown as Record<string, unknown> },
+      { collection: 'kyc_documents', id: selfieDoc.id, data: selfieDoc as unknown as Record<string, unknown> },
+    ]);
+
+    broadcastSyncEvent({
+      type: 'KYC_SUBMITTED',
+      syncRevision: rev,
+      syncedAt: dbStore.lastSyncedAt,
+      entityId: user.id,
+      targetUserIds: [user.id],
+      notifyAdmins: true,
     });
 
     return { kycStatus: user.kycStatus, documents: [idDoc, selfieDoc] };
@@ -162,6 +181,8 @@ class KycService {
     if (!user) throw new Error('User not found');
     const before = { kycStatus: user.kycStatus, kycTier: user.kycTier };
     const now = new Date().toISOString();
+    const updatedDocs: KycDocumentRecord[] = [];
+    let provisionedAccounts: ReturnType<typeof accountsService.provisionWalletsForApprovedUser> = [];
 
     if (params.decision === 'APPROVED') {
       user.kycStatus = KycStatus.APPROVED;
@@ -171,9 +192,10 @@ class KycService {
           doc.status = KycStatus.APPROVED;
           doc.reviewedBy = params.officerId;
           doc.reviewedAt = now;
+          updatedDocs.push(doc);
         }
       }
-      accountsService.provisionWalletsForApprovedUser(user.id);
+      provisionedAccounts = accountsService.provisionWalletsForApprovedUser(user.id);
     } else {
       user.kycStatus = params.decision === 'REJECTED' ? KycStatus.REJECTED : KycStatus.NEEDS_MORE_INFO;
       for (const doc of dbStore.kycDocuments.values()) {
@@ -182,9 +204,12 @@ class KycService {
           doc.reviewedBy = params.officerId;
           doc.reviewedAt = now;
           doc.rejectionReason = params.reason || 'Verification check did not pass.';
+          updatedDocs.push(doc);
         }
       }
     }
+    user.version = (user.version ?? 1) + 1;
+    user.updatedAt = now;
 
     await notificationService.enqueue({
       userId: user.id,
@@ -203,6 +228,30 @@ class KycService {
       entity: `user:${user.id}`,
       before,
       after: { kycStatus: user.kycStatus, kycTier: user.kycTier, reason: params.reason || null },
+    });
+
+    const { passwordHash: _pw, ...safeUser } = user;
+    const rev = await dbStore.persistImmediate([
+      { collection: 'users', id: user.id, data: safeUser as unknown as Record<string, unknown> },
+      ...updatedDocs.map((d) => ({
+        collection: 'kyc_documents',
+        id: d.id,
+        data: d as unknown as Record<string, unknown>,
+      })),
+      ...provisionedAccounts.map((a) => ({
+        collection: 'accounts',
+        id: a.id,
+        data: a as unknown as Record<string, unknown>,
+      })),
+    ]);
+
+    broadcastSyncEvent({
+      type: 'KYC_UPDATED',
+      syncRevision: rev,
+      syncedAt: dbStore.lastSyncedAt,
+      entityId: user.id,
+      targetUserIds: [user.id],
+      notifyAdmins: true,
     });
 
     return {

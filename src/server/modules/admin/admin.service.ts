@@ -11,6 +11,7 @@ import {
   UserStatus,
   WithdrawalStatus,
 } from '../../../shared/types.ts';
+import { broadcastSyncEvent } from '../../db/realtime.ts';
 import { dbStore } from '../../db/store.ts';
 import { recordAuditLog } from '../../security/audit.ts';
 import { ledgerService } from '../ledger/ledger.service.ts';
@@ -72,6 +73,7 @@ class AdminService {
       makerCheckerThresholdMinor: dbStore.makerCheckerThresholdMinor,
       ledgerInvariant,
       balancesByCurrency,
+      syncRevision: dbStore.syncRevision,
     };
   }
 
@@ -88,12 +90,18 @@ class AdminService {
     if (!user) throw new Error('User not found');
 
     const before = { status: user.status, freezeReason: user.freezeReason };
+    const now = new Date().toISOString();
     user.status = params.freeze ? UserStatus.FROZEN : UserStatus.ACTIVE;
     user.freezeReason = params.freeze ? params.reason.trim() : null;
+    user.version = (user.version ?? 1) + 1;
+    user.updatedAt = now;
 
+    const affectedAccounts = [...dbStore.accounts.values()].filter((a) => a.userId === user.id);
     if (params.freeze) {
-      for (const acc of dbStore.accounts.values()) {
-        if (acc.userId === user.id) acc.status = 'FROZEN' as typeof acc.status;
+      for (const acc of affectedAccounts) {
+        acc.status = 'FROZEN' as typeof acc.status;
+        acc.version = (acc.version ?? 1) + 1;
+        acc.updatedAt = now;
       }
       await notificationService.enqueue({
         userId: user.id,
@@ -102,8 +110,10 @@ class AdminService {
         body: `Your wallet account has been restricted: ${params.reason.trim()}`,
       });
     } else {
-      for (const acc of dbStore.accounts.values()) {
-        if (acc.userId === user.id) acc.status = 'ACTIVE' as typeof acc.status;
+      for (const acc of affectedAccounts) {
+        acc.status = 'ACTIVE' as typeof acc.status;
+        acc.version = (acc.version ?? 1) + 1;
+        acc.updatedAt = now;
       }
     }
 
@@ -114,6 +124,25 @@ class AdminService {
       entity: `user:${user.id}`,
       before,
       after: { status: user.status, freezeReason: user.freezeReason },
+    });
+
+    const { passwordHash: _pw, ...safeUser } = user;
+    const rev = await dbStore.persistImmediate([
+      { collection: 'users', id: user.id, data: safeUser as unknown as Record<string, unknown> },
+      ...affectedAccounts.map((acc) => ({
+        collection: 'accounts',
+        id: acc.id,
+        data: acc as unknown as Record<string, unknown>,
+      })),
+    ]);
+
+    broadcastSyncEvent({
+      type: 'USER_STATUS_CHANGED',
+      syncRevision: rev,
+      syncedAt: dbStore.lastSyncedAt,
+      entityId: user.id,
+      targetUserIds: [user.id],
+      notifyAdmins: true,
     });
 
     return user;
@@ -272,8 +301,13 @@ class AdminService {
         body: `Your Comfort Secure Wallet staff access application was declined: ${params.reason || 'Administrative decision'}`,
       });
     }
+    target.version = (target.version ?? 1) + 1;
+    target.updatedAt = new Date().toISOString();
 
-    dbStore.mirrorDoc('users', target.id, { ...target, passwordHash: undefined });
+    const { passwordHash: _pw, ...safe } = target;
+    const rev = await dbStore.persistImmediate([
+      { collection: 'users', id: target.id, data: safe as unknown as Record<string, unknown> },
+    ]);
 
     recordAuditLog({
       actorId: actor.id,
@@ -288,7 +322,15 @@ class AdminService {
       },
     });
 
-    const { passwordHash: _pw, ...safe } = target;
+    broadcastSyncEvent({
+      type: 'USER_STATUS_CHANGED',
+      syncRevision: rev,
+      syncedAt: dbStore.lastSyncedAt,
+      entityId: target.id,
+      targetUserIds: [target.id],
+      notifyAdmins: true,
+    });
+
     return safe;
   }
 }

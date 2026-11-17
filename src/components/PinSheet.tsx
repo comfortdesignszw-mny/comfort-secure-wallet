@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { Delete, Lock, X } from 'lucide-react';
 import { Currency } from '../shared/types.ts';
 import { formatMinorUnits } from '../shared/money.ts';
@@ -32,10 +32,13 @@ export const PinSheet: React.FC<PinSheetProps> = ({
   const [pin, setPin] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
 
   if (!open) return null;
 
   const submitPin = async (candidate: string) => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     setLoading(true);
     setError(null);
     try {
@@ -59,12 +62,13 @@ export const PinSheet: React.FC<PinSheetProps> = ({
       setPin('');
       setError(err instanceof Error ? err.message : 'PIN verification failed');
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   };
 
   const handleDigit = (d: string) => {
-    if (loading || pin.length >= 6) return;
+    if (inFlightRef.current || loading || pin.length >= 6) return;
     const next = pin + d;
     setPin(next);
     setError(null);
@@ -74,7 +78,7 @@ export const PinSheet: React.FC<PinSheetProps> = ({
   };
 
   const handleBackspace = () => {
-    if (loading) return;
+    if (inFlightRef.current || loading) return;
     setPin((prev) => prev.slice(0, -1));
   };
 
